@@ -1,0 +1,39 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python / UV
+.venv/
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local runtime data
+*.sqlite3
+*.db
+redis-data/
+uploads/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
