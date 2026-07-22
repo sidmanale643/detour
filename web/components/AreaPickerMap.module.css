@@ -1,0 +1,6 @@
+.shell { position:relative; overflow:hidden; min-height:205px; border:1px solid #c9d8bc; border-radius:18px; background:#d9e6cc; isolation:isolate; }
+.map { position:absolute; inset:0 0 29px; width:100%; height:calc(100% - 29px); border:0; }
+.map :global(.maplibregl-canvas) { outline:0; }.map :global(.maplibregl-ctrl-attrib) { font-size:9px; }
+.marker { display:grid; place-items:center; width:40px; height:40px; border:3px solid #fffdf8; border-radius:50% 50% 50% 7px; background:#ff745d; color:#fff; box-shadow:0 4px 0 #111b3a25; transform:rotate(-45deg); }.marker span { transform:rotate(45deg); font-size:18px; }
+.empty { display:grid; place-items:center; min-height:176px; padding:24px; color:#536076; background:#f5f1e9; text-align:center; font:12px/1.4 "DM Mono",monospace; }
+.caption { position:absolute; right:0; bottom:0; left:0; height:29px; padding:8px 10px; background:#fffdf8; color:#697084; font:9px "DM Mono",monospace; }
