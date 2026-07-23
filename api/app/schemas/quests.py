@@ -98,6 +98,7 @@ WALKING_METRES_PER_MINUTE = 80
 MAX_SEARCH_RADIUS_METRES = 8000
 OSRM_MATRIX_LIMIT = 24
 MIN_SAFE_PLACE_CANDIDATES = 6
+MAX_GENERATION_PLACE_CANDIDATES = 40
 
 
 class PlaceCandidateIn(BaseModel):
@@ -132,7 +133,9 @@ class QuestGenerationRequest(BaseModel):
     social_comfort: SocialComfort = SocialComfort.solo_only
     environment_preference: EnvironmentPreference = EnvironmentPreference.either
     accessibility_notes: str | None = Field(default=None, max_length=500)
-    place_candidates: list[PlaceCandidateIn] = Field(default_factory=list, max_length=40)
+    place_candidates: list[PlaceCandidateIn] = Field(
+        default_factory=list, max_length=MAX_GENERATION_PLACE_CANDIDATES
+    )
     exclude_titles: list[str] = Field(default_factory=list, max_length=50)
     exclude_candidate_ids: list[str] = Field(default_factory=list, max_length=50)
 

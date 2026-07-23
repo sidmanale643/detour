@@ -67,6 +67,7 @@ app.add_middleware(
 passwords = PasswordHasher()
 DECK_SIZE = 1
 MAX_GENERATION_BATCH = 5
+GENERATION_CANDIDATE_SHORTLIST = 12
 
 def now() -> datetime:
     return datetime.now(UTC)
@@ -608,6 +609,9 @@ def generate_quests_for_profile(
             raise HTTPException(
                 503, "Could not build a full quest deck from nearby places"
             )
+        # Candidates are ranked by walking time and distance. Keep the LLM input
+        # focused: one quest only needs a small, strong set of nearby options.
+        batch_candidates = batch_candidates[:GENERATION_CANDIDATE_SHORTLIST]
         request = QuestGenerationRequest(
             city=profile["home_city"] or "your city",
             categories=categories,
