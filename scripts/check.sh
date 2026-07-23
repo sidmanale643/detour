@@ -5,7 +5,7 @@ set -euo pipefail
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ -f "$root_dir/web/package.json" ]]; then
-  (cd "$root_dir/web" && npm run lint && npm run typecheck && npm run build)
+  (cd "$root_dir/web" && pnpm run lint && pnpm run typecheck && pnpm run build)
 else
   echo "Skipping web checks: web/package.json is not present."
 fi

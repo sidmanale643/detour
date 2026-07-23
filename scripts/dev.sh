@@ -44,9 +44,9 @@ if [[ -f "$api_dir/.env" ]]; then
   set +a
 fi
 
-(cd "$web_dir" && exec npm run dev) &
+(cd "$web_dir" && exec pnpm run dev) &
 web_pid=$!
-(cd "$api_dir" && exec uv run fastapi dev app.main:app --port 8000) &
+(cd "$api_dir" && exec uv run fastapi dev app/main.py --port 8000) &
 api_pid=$!
 
 wait -n "$web_pid" "$api_pid"

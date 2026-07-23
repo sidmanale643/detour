@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Map as MapLibreMap, Marker } from "maplibre-gl";
+import type { Feature, LineString } from "geojson";
 import type { Coordinate, Quest } from "../lib/quest-api";
 import { gameMapStyle, osrmBaseUrl } from "../lib/osm-map";
 import styles from "./QuestMap.module.css";
@@ -39,7 +40,7 @@ export default function QuestMap({ quests, activeQuest, onSelectQuest, homeCente
   const clearRoute = useCallback(() => { routeRequestRef.current += 1; const map = mapRef.current; if (map?.getLayer(ROUTE_INNER_LAYER)) map.removeLayer(ROUTE_INNER_LAYER); if (map?.getLayer(ROUTE_CASING_LAYER)) map.removeLayer(ROUTE_CASING_LAYER); if (map?.getSource(ROUTE_SOURCE)) map.removeSource(ROUTE_SOURCE); setRouteSummary(null); setRouteStep("idle"); }, []);
   const stopLocationTracking = useCallback(() => { if (locationWatchRef.current != null) navigator.geolocation?.clearWatch(locationWatchRef.current); locationWatchRef.current = null; }, []);
   const focusAnchor = useCallback(() => { const map = mapRef.current; if (!map || !anchor) return; map.flyTo({ center: anchor, ...GAME_CAMERA, offset: [0, Math.min(110, map.getContainer().clientHeight * .18)], duration: 550, essential: true }); }, [anchor]);
-  const addRoute = useCallback((coordinates: unknown) => { const map = mapRef.current; if (!map) return; map.addSource(ROUTE_SOURCE, { type: "geojson", data: { type: "Feature", properties: {}, geometry: { type: "LineString", coordinates } } as GeoJSON.Feature<GeoJSON.LineString> }); map.addLayer({ id: ROUTE_CASING_LAYER, type: "line", source: ROUTE_SOURCE, layout: { "line-cap": "round", "line-join": "round" }, paint: { "line-color": "#fff3db", "line-width": 9, "line-opacity": .95 } }); map.addLayer({ id: ROUTE_INNER_LAYER, type: "line", source: ROUTE_SOURCE, layout: { "line-cap": "round", "line-join": "round" }, paint: { "line-color": "#ff745d", "line-width": 3.5, "line-opacity": .95, "line-dasharray": [1.5, 1.5] } }); }, []);
+  const addRoute = useCallback((coordinates: unknown) => { const map = mapRef.current; if (!map) return; map.addSource(ROUTE_SOURCE, { type: "geojson", data: { type: "Feature", properties: {}, geometry: { type: "LineString", coordinates } } as Feature<LineString> }); map.addLayer({ id: ROUTE_CASING_LAYER, type: "line", source: ROUTE_SOURCE, layout: { "line-cap": "round", "line-join": "round" }, paint: { "line-color": "#fff3db", "line-width": 9, "line-opacity": .95 } }); map.addLayer({ id: ROUTE_INNER_LAYER, type: "line", source: ROUTE_SOURCE, layout: { "line-cap": "round", "line-join": "round" }, paint: { "line-color": "#ff745d", "line-width": 3.5, "line-opacity": .95, "line-dasharray": [1.5, 1.5] } }); }, []);
   const loadWalkingRoute = useCallback((destination: [number, number]) => {
     clearRoute();
     if (!navigator.geolocation) {

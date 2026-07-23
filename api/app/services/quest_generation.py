@@ -592,13 +592,84 @@ class QuestGenerationService:
         return collected
 
 
+class MockQuestLlmClient:
+    """Mock quest generator for local development when no API key is provided."""
+
+    def complete_batch(
+        self,
+        *,
+        system: str,
+        user: str,
+        schema: dict,
+    ) -> GeneratedQuestBatch:
+        from ..schemas.quests import QuestCategory
+        try:
+            payload = json.loads(user)
+            candidates = payload.get("place_candidates", [])
+            count = payload.get("requested_count", len(candidates))
+        except Exception:
+            candidates = []
+            count = 1
+
+        quests = []
+        for i in range(min(count, len(candidates))):
+            cand = candidates[i]
+            cid = cand.get("candidate_id")
+            name = cand.get("name", "Unknown Place")
+            cat = cand.get("category", "nature")
+            
+            # Simple template based on category
+            activity_type = "explore"
+            if cat == "nature":
+                title = f"Appreciate the greenery at {name}"
+                desc = f"Walk around {name}, find a quiet spot near the trees, and observe the birds or leaves for 5 minutes."
+                activity_type = "observe"
+            elif cat == "culture":
+                title = f"Discover local heritage at {name}"
+                desc = f"Locate the main information plaque, monument, or historical sign at {name} and read it carefully."
+                activity_type = "read"
+            elif cat == "creativity":
+                title = f"Sketch the view at {name}"
+                desc = f"Take a seat at {name} and sketch the most interesting shape or detail you can see."
+                activity_type = "sketch"
+            elif cat == "mindfulness":
+                title = f"Mindful breathing at {name}"
+                desc = f"Sit quietly at {name}, close your eyes, and focus entirely on the sounds around you."
+                activity_type = "breathe"
+            elif cat == "fitness":
+                title = f"Paced walk around {name}"
+                desc = f"Take a continuous 15-minute brisk walk around the perimeter of {name}."
+                activity_type = "walk"
+            else: # learning / default
+                title = f"Learn about {name}"
+                desc = f"Observe the architecture, layout, or design of {name} and note one thing you didn't expect."
+                activity_type = "observe"
+
+            quests.append(
+                GeneratedQuestDraft(
+                    title=title,
+                    description=desc,
+                    category=QuestCategory(cat),
+                    difficulty=Difficulty.medium,
+                    candidate_id=cid,
+                    estimated_activity_minutes=15,
+                    cost_band=CostBand.free,
+                    activity_type=activity_type,
+                    safety_notes="Stay aware of your surroundings and yield to pedestrians."
+                )
+            )
+
+        return GeneratedQuestBatch(quests=quests)
+
+
 def build_service_from_settings() -> QuestGenerationService:
-    """Factory used by the API. Requires DETOUR_OPENROUTER_API_KEY."""
+    """Factory used by the API. Falls back to MockQuestLlmClient if DETOUR_OPENROUTER_API_KEY is missing."""
     from ..config import settings
     from ..providers import OpenRouterQuestGenerator
 
     if not settings.openrouter_api_key:
-        raise QuestGenerationError(
-            "DETOUR_OPENROUTER_API_KEY is required for quest generation"
+        logger.warning(
+            "DETOUR_OPENROUTER_API_KEY is not configured. Falling back to local mock quest generator."
         )
+        return QuestGenerationService(llm=MockQuestLlmClient())
     return QuestGenerationService(llm=OpenRouterQuestGenerator())
