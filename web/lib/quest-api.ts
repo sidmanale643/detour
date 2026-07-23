@@ -1,5 +1,5 @@
 export type QuestCategory = "Explore" | "Move" | "Create" | "Mind" | "Taste" | "Learn";
-export type QuestStatus = "offered" | "completed" | "skipped" | "superseded" | "expired";
+export type QuestStatus = "offered" | "active" | "completed" | "skipped" | "superseded" | "expired";
 export type Motivation =
   | "explore"
   | "move"
@@ -27,6 +27,8 @@ export type Quest = {
   emoji: string;
   accent: string;
   status: QuestStatus;
+  startedAt: string | null;
+  startExpiresAt: string | null;
   time: string;
   detail: string;
   latitude?: number;
@@ -234,6 +236,8 @@ function mapQuest(raw: Record<string, unknown>, index = 0): Quest {
     emoji: visual.emoji,
     accent: accents[index % accents.length],
     status: String(raw.state || "offered") as QuestStatus,
+    startedAt: raw.started_at ? String(raw.started_at) : null,
+    startExpiresAt: raw.start_expires_at ? String(raw.start_expires_at) : null,
     time: start && end ? `${start} – ${end}` : "Anytime",
     detail: String(raw.description || "A small invitation to explore your city."),
     ...(Number.isFinite(latitude) && Number.isFinite(longitude)
@@ -519,6 +523,13 @@ class HttpQuestApi {
       progress: mapProgress(data.progress),
       awardedXp: data.awarded_xp as number,
     };
+  }
+
+  async start(id: string): Promise<Quest> {
+    const data = await (
+      await this.request(`/v1/quests/${id}/start`, { method: "POST" })
+    ).json();
+    return mapQuest(data);
   }
 
   async skip(id: string) {

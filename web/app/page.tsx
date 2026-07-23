@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   INTEREST_CHIPS,
   authDisabled,
@@ -61,6 +61,7 @@ export default function DetourApp() {
   const [pending, setPending] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [questError, setQuestError] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [booted, setBooted] = useState(false);
   const [editingPreferences, setEditingPreferences] = useState(false);
@@ -79,18 +80,87 @@ export default function DetourApp() {
     }
   }, [profile]);
   const completed = useMemo(() => quests.filter((q) => q.status === "completed").length, [quests]);
-  const sync = async () => { const deck = await questApi.today(); setQuests([...deck.quests]); setRefreshAvailable(deck.refreshAvailable); };
-  const complete = async (quest: Quest) => {
+  const sync = useCallback(async () => { const deck = await questApi.today(); setQuests([...deck.quests]); setRefreshAvailable(deck.refreshAvailable); }, []);
+  const start = async (quest: Quest) => {
     if (pending || quest.status !== "offered") return;
-    setPending(quest.id); setToast("Completion pending sync");
-    const result = await questApi.complete(quest.id);
-    setProgress(result.progress); await sync(); setPending(null); setActive(result.quest || null); setToast(`+${quest.xp} XP earned`); window.setTimeout(() => setToast(null), 2200);
+    setPending(quest.id);
+    setQuestError(null);
+    setToast("Starting your one-hour quest…");
+    try {
+      await questApi.start(quest.id);
+      await sync();
+      // The running quest remains in the synced deck. Close the sheet so the
+      // player immediately sees the map and its GPS route.
+      setActive(null);
+      setTab("map");
+      setToast("Quest started · 1 hour on the clock");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not start this quest. Try again.";
+      setQuestError(message);
+      setToast(message);
+    } finally {
+      setPending(null);
+    }
   };
-  const skip = async (quest: Quest) => { await questApi.skip(quest.id); await sync(); setActive(null); };
-  const refresh = async () => { const deck = await questApi.refreshDeck(); setQuests([...deck.quests]); setRefreshAvailable(deck.refreshAvailable); setToast("Your city deck has been refreshed"); window.setTimeout(() => setToast(null), 2200); };
+  const complete = async (quest: Quest) => {
+    if (pending || quest.status !== "active") return;
+    setPending(quest.id); setToast("Completion pending sync");
+    try {
+      const result = await questApi.complete(quest.id);
+      setProgress(result.progress); await sync(); setActive(result.quest || null); setToast(`+${quest.xp} XP earned`); window.setTimeout(() => setToast(null), 2200);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not complete this quest. Try again.";
+      setQuestError(message);
+      setToast(message);
+    } finally {
+      setPending(null);
+    }
+  };
+  const skip = async (quest: Quest) => {
+    try {
+      await questApi.skip(quest.id);
+      await sync();
+      setActive(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not dismiss this quest. Try again.";
+      setQuestError(message);
+      setToast(message);
+    }
+  };
+  const expireActiveQuest = useCallback(async (questId: string) => {
+    setActive((current) => current?.id === questId ? null : current);
+    setToast("Time is up. This quest has expired.");
+    try {
+      await sync();
+    } catch {
+      // The local sheet is closed even if a transient sync fails.
+    }
+  }, [sync]);
+  useEffect(() => {
+    const running = quests.find((quest) => quest.status === "active" && quest.startExpiresAt);
+    if (!running?.startExpiresAt) return;
+    const delay = Math.max(0, new Date(running.startExpiresAt).getTime() - Date.now());
+    const timeout = window.setTimeout(() => { void expireActiveQuest(running.id); }, delay);
+    return () => window.clearTimeout(timeout);
+  }, [expireActiveQuest, quests]);
+  const refresh = async () => {
+    setQuestError(null);
+    try {
+      const deck = await questApi.refreshDeck();
+      setQuests([...deck.quests]);
+      setRefreshAvailable(deck.refreshAvailable);
+      setToast("Your city deck has been refreshed");
+      window.setTimeout(() => setToast(null), 2200);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not refresh quests. Try again.";
+      setQuestError(message);
+      setToast(message);
+    }
+  };
   const generate = async () => {
     if (generating) return;
     setGenerating(true);
+    setQuestError(null);
     setToast("Finding quests near you…");
     try {
       const deck = await questApi.today();
@@ -98,7 +168,9 @@ export default function DetourApp() {
       setRefreshAvailable(deck.refreshAvailable);
       setToast(deck.quests.length ? "Your quests are ready" : "No quests were generated. Try again.");
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "Could not generate quests. Try again.");
+      const message = error instanceof Error ? error.message : "Could not generate quests. Try again.";
+      setQuestError(message);
+      setToast(message);
     } finally {
       setGenerating(false);
       window.setTimeout(() => setToast(null), 3200);
@@ -123,11 +195,12 @@ export default function DetourApp() {
 
   return <main className={`app-shell ${tab === "map" ? "map-app" : ""}`}>
     <header className="topbar"><div className="brand"><span className="brand-mark">✦</span><span>Detour</span></div><button className="avatar" onClick={() => setTab("me")}>S</button></header>
-    {tab === "map" && <QuestMap quests={quests} activeQuest={active} onSelectQuest={setActive} homeCenter={profile.homeZone.center} homeLabel={profile.homeZone.city} level={progress.level} xp={progress.xp} completedCount={completed} dateLabel={new Intl.DateTimeFormat("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: profile.timezone }).format(new Date()).toUpperCase()} refreshAvailable={refreshAvailable} onRefresh={refresh} onGenerate={generate} generating={generating} />}
+    {questError && <div className="quest-error" role="alert"><span>{questError}</span><button type="button" onClick={generate}>Try again</button></div>}
+    {tab === "map" && <QuestMap quests={quests} activeQuest={active ?? quests.find((quest) => quest.status === "active") ?? null} onSelectQuest={setActive} homeCenter={profile.homeZone.center} homeLabel={profile.homeZone.city} level={progress.level} xp={progress.xp} completedCount={completed} dateLabel={new Intl.DateTimeFormat("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: profile.timezone }).format(new Date()).toUpperCase()} refreshAvailable={refreshAvailable} onRefresh={refresh} onGenerate={generate} generating={generating} />}
     {tab === "quests" && <QuestList quests={quests} onSelect={setActive} onGenerate={generate} generating={generating} />}
     {tab === "me" && <UserProfile progress={progress} completed={completed} onEditPreferences={() => setEditingPreferences(true)} onSignOut={authDisabled ? undefined : async () => { await questApi.logout(); setProfile(null); }} />}
     <nav className="bottom-nav"><button className={tab === "map" ? "selected" : ""} onClick={() => setTab("map")}><span>⌖</span>Map</button><button className={tab === "quests" ? "selected" : ""} onClick={() => setTab("quests")}><span>☷</span>Quests</button><button className={tab === "me" ? "selected" : ""} onClick={() => setTab("me")}><span>◉</span>Me</button></nav>
-    {active && <QuestSheet quest={active} pending={pending === active.id} onClose={() => setActive(null)} onComplete={() => complete(active)} onSkip={() => skip(active)} />}
+    {active && <QuestSheet quest={active} pending={pending === active.id} onClose={() => setActive(null)} onStart={() => start(active)} onComplete={() => complete(active)} onSkip={() => skip(active)} onExpired={() => expireActiveQuest(active.id)} />}
     {toast && <div className="toast">{toast}</div>}
   </main>;
 }
@@ -148,7 +221,7 @@ function QuestList({ quests, onSelect, onGenerate, generating }: { quests: Quest
             <span>
               <small>{q.category} · {q.distance}</small>
               <b>{q.title}</b>
-              <em>{q.status === "completed" ? "Completed" : q.status === "skipped" ? "Unavailable" : `+${q.xp} XP`}</em>
+              <em>{q.status === "completed" ? "Completed" : q.status === "active" ? "In progress · 1 hour" : q.status === "skipped" || q.status === "expired" ? "Unavailable" : "Begin quest"}</em>
             </span>
             <strong>›</strong>
           </button>
@@ -186,7 +259,37 @@ function UserProfile({ progress, completed, onEditPreferences, onSignOut }: { pr
   );
 }
 
-function QuestSheet({ quest, pending, onClose, onComplete, onSkip }: { quest: Quest; pending: boolean; onClose: () => void; onComplete: () => void; onSkip: () => void }) {
+function formatRemaining(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function QuestTimer({ deadline, onExpired }: { deadline: string | null; onExpired: () => void }) {
+  const [remaining, setRemaining] = useState(() => deadline ? new Date(deadline).getTime() - Date.now() : 0);
+  const expiredCallback = useRef(onExpired);
+  expiredCallback.current = onExpired;
+  useEffect(() => {
+    if (!deadline) return;
+    let notified = false;
+    const tick = () => {
+      const next = new Date(deadline).getTime() - Date.now();
+      setRemaining(next);
+      if (next <= 0 && !notified) {
+        notified = true;
+        expiredCallback.current();
+      }
+    };
+    tick();
+    const interval = window.setInterval(tick, 1000);
+    return () => window.clearInterval(interval);
+  }, [deadline]);
+  return <span className="quest-timer" role="timer" aria-label={`${formatRemaining(remaining)} remaining`}>⏱ {formatRemaining(remaining)}</span>;
+}
+
+function QuestSheet({ quest, pending, onClose, onStart, onComplete, onSkip, onExpired }: { quest: Quest; pending: boolean; onClose: () => void; onStart: () => void; onComplete: () => void; onSkip: () => void; onExpired: () => void }) {
   const done = quest.status === "completed";
   const walkLabel =
     quest.walkingMinutes != null
@@ -214,16 +317,26 @@ function QuestSheet({ quest, pending, onClose, onComplete, onSkip }: { quest: Qu
           {activityLabel && <span>◷ {activityLabel}</span>}
           {!walkLabel && !activityLabel && <span>◷ {quest.duration}</span>}
           <span>◒ {quest.time}</span>
+          {quest.status === "active" && <QuestTimer deadline={quest.startExpiresAt} onExpired={onExpired} />}
           <b>+{quest.xp} XP</b>
         </div>
         {done ? (
           <button className="completed-button" disabled>✓ Quest completed</button>
         ) : quest.status === "skipped" ? (
           <button className="skipped-button" disabled>Quest unavailable</button>
-        ) : (
+        ) : quest.status === "expired" ? (
+          <button className="skipped-button" disabled>Quest timer expired</button>
+        ) : quest.status === "active" ? (
           <>
             <button className="complete-button" disabled={pending} onClick={onComplete}>
-              {pending ? "Syncing completion…" : "✓  Completed"}
+              {pending ? "Syncing completion…" : "✓ Completed"}
+            </button>
+            <button className="skip-button" onClick={onSkip}>Stop quest</button>
+          </>
+        ) : (
+          <>
+            <button className="complete-button" disabled={pending} onClick={onStart}>
+              {pending ? "Starting quest…" : "▶ Begin quest · 1 hour"}
             </button>
             <button className="skip-button" onClick={onSkip}>Quest unavailable</button>
           </>
