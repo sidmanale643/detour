@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS quests (
   difficulty TEXT NOT NULL, base_xp INTEGER NOT NULL, place_name TEXT NOT NULL,
   latitude REAL NOT NULL, longitude REAL NOT NULL, time_window_start TEXT, time_window_end TEXT,
   expires_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'offered', completed_at TEXT,
+  started_at TEXT, start_expires_at TEXT,
   skipped_at TEXT, superseded_at TEXT, created_at TEXT NOT NULL, UNIQUE(deck_id, slot)
 );
 CREATE TABLE IF NOT EXISTS completions (
@@ -84,6 +85,8 @@ _QUEST_MIGRATIONS: list[tuple[str, str]] = [
     ("estimated_activity_minutes", "ALTER TABLE quests ADD COLUMN estimated_activity_minutes INTEGER"),
     ("cost_band", "ALTER TABLE quests ADD COLUMN cost_band TEXT"),
     ("activity_type", "ALTER TABLE quests ADD COLUMN activity_type TEXT"),
+    ("started_at", "ALTER TABLE quests ADD COLUMN started_at TEXT"),
+    ("start_expires_at", "ALTER TABLE quests ADD COLUMN start_expires_at TEXT"),
 ]
 
 

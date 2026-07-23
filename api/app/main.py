@@ -303,6 +303,8 @@ class QuestOut(BaseModel):
     expires_at: datetime
     state: str
     completed_at: datetime | None = None
+    started_at: datetime | None = None
+    start_expires_at: datetime | None = None
     place_provider_id: str | None = None
     place_type: str | None = None
     distance_meters: int | None = None
@@ -338,6 +340,12 @@ def quest_out(row: sqlite3.Row) -> QuestOut:
         expires_at=data["expires_at"],
         state=data["state"],
         completed_at=data.get("completed_at"),
+        started_at=parse_iso(data["started_at"]) if data.get("started_at") else None,
+        start_expires_at=(
+            parse_iso(data["start_expires_at"])
+            if data.get("start_expires_at")
+            else None
+        ),
         place_provider_id=data.get("place_provider_id"),
         place_type=data.get("place_type"),
         distance_meters=data.get("distance_meters"),
@@ -690,6 +698,16 @@ def insert_quest_row(
 def deck_for(user: sqlite3.Row, profile: sqlite3.Row) -> DeckOut:
     local_day, zone = local_context(user)
     categories = parse_categories(profile["categories_json"])
+    with transaction() as db:
+        db.execute(
+            """UPDATE quests
+               SET state='expired'
+             WHERE state='active'
+               AND start_expires_at IS NOT NULL
+               AND start_expires_at <= ?
+               AND deck_id IN (SELECT id FROM decks WHERE user_id=?)""",
+            (iso(now()), user["id"]),
+        )
     with connect() as db:
         deck = db.execute(
             "SELECT * FROM decks WHERE user_id=? AND local_date=?",
@@ -1233,6 +1251,36 @@ def refresh_deck(user: sqlite3.Row = Depends(require_user)) -> DeckOut:
     return deck_for(user, profile)
 
 
+@app.post("/v1/quests/{quest_id}/start", response_model=QuestOut)
+def start_quest(quest_id: str, user: sqlite3.Row = Depends(require_user)) -> QuestOut:
+    """Start a quest and give it an authoritative one-hour completion window."""
+    with transaction() as db:
+        row = db.execute(
+            "SELECT q.* FROM quests q JOIN decks d ON d.id=q.deck_id WHERE q.id=? AND d.user_id=?",
+            (quest_id, user["id"]),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Quest not found")
+        if row["state"] == "active":
+            if row["start_expires_at"] and parse_iso(row["start_expires_at"]) > now():
+                return quest_out(row)
+            db.execute("UPDATE quests SET state='expired' WHERE id=?", (quest_id,))
+            raise HTTPException(409, "Quest timer has expired")
+        if row["state"] != "offered":
+            raise HTTPException(409, "Quest is not available to start")
+        if parse_iso(row["expires_at"]) <= now():
+            db.execute("UPDATE quests SET state='expired' WHERE id=?", (quest_id,))
+            raise HTTPException(409, "Quest has expired")
+        started_at = now()
+        start_expires_at = started_at + timedelta(hours=1)
+        db.execute(
+            "UPDATE quests SET state='active',started_at=?,start_expires_at=? WHERE id=?",
+            (iso(started_at), iso(start_expires_at), quest_id),
+        )
+        row = db.execute("SELECT * FROM quests WHERE id=?", (quest_id,)).fetchone()
+    return quest_out(row)
+
+
 @app.post("/v1/quests/{quest_id}/skip")
 def skip_quest(quest_id: str, user: sqlite3.Row = Depends(require_user)) -> dict:
     with transaction() as db:
@@ -1242,7 +1290,7 @@ def skip_quest(quest_id: str, user: sqlite3.Row = Depends(require_user)) -> dict
         ).fetchone()
         if not row:
             raise HTTPException(404, "Quest not found")
-        if row["state"] != "offered":
+        if row["state"] not in {"offered", "active"}:
             raise HTTPException(409, "Quest is not available to skip")
         db.execute(
             "UPDATE quests SET state='skipped',skipped_at=? WHERE id=?",
@@ -1278,11 +1326,14 @@ def complete_quest(
         ).fetchone()
         if not row:
             raise HTTPException(404, "Quest not found")
-        if row["state"] != "offered":
-            raise HTTPException(409, "Quest cannot be completed")
+        if row["state"] != "active":
+            raise HTTPException(409, "Start the quest before completing it")
         if parse_iso(row["expires_at"]) <= now():
             db.execute("UPDATE quests SET state='expired' WHERE id=?", (quest_id,))
             raise HTTPException(409, "Quest has expired")
+        if row["start_expires_at"] and parse_iso(row["start_expires_at"]) <= now():
+            db.execute("UPDATE quests SET state='expired' WHERE id=?", (quest_id,))
+            raise HTTPException(409, "Quest timer has expired")
         _, zone = local_context(user)
         local_now = now().astimezone(zone)
         multiplier = 1.0
