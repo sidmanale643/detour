@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from typing import Literal
 
 import httpx
 
@@ -104,6 +107,316 @@ class PlaceCandidate:
     distance_metres: int = 0
     walking_minutes: int = 0
     distance_source: DistanceSource = DistanceSource.approximate
+    landmark_rank: int = 10
+
+
+@dataclass(frozen=True)
+class DiscoveryPlace:
+    """A display-oriented place from a live discovery provider."""
+
+    provider: str
+    provider_id: str
+    name: str
+    place_type: str
+    latitude: float
+    longitude: float
+    distance_metres: int
+    trip_kind: str
+    description: str | None = None
+    image_url: str | None = None
+    external_url: str | None = None
+    rating: float | None = None
+    review_count: int | None = None
+    open_now: bool | None = None
+    cuisines: list[str] = field(default_factory=list)
+
+
+class CityDiscoveryProvider:
+    """Live city catalogue built from OSM, Wikidata, and optionally Google Places."""
+
+    NEARBY_RADIUS_METRES = 15_000
+    DAY_TRIP_RADIUS_METRES = 150_000
+
+    def discover(
+        self,
+        *,
+        city: str,
+        center: tuple[float, float],
+        food_query: str | None = None,
+    ) -> dict[str, object]:
+        nearby = self._osm_nearby(center)
+        landmarks = self._wikidata_landmarks(center)
+        city_highlights, day_trips = self._split_landmarks(landmarks)
+        food, food_available = self._google_food(city, center, food_query)
+        return {
+            "city": city,
+            "nearby": [self._as_dict(place) for place in nearby],
+            "city_highlights": [self._as_dict(place) for place in city_highlights],
+            "day_trips": [self._as_dict(place) for place in day_trips],
+            "food": [self._as_dict(place) for place in food],
+            "food_available": food_available,
+        }
+
+    def _osm_nearby(self, center: tuple[float, float]) -> list[DiscoveryPlace]:
+        query = f"""
+        [out:json][timeout:75];
+        (
+          nwr[\"name\"][leisure~\"park|garden|nature_reserve\"](around:{self.NEARBY_RADIUS_METRES},{center[0]},{center[1]});
+          nwr[\"name\"][tourism~\"attraction|museum|gallery|viewpoint\"](around:{self.NEARBY_RADIUS_METRES},{center[0]},{center[1]});
+          nwr[\"name\"][historic](around:{self.NEARBY_RADIUS_METRES},{center[0]},{center[1]});
+          nwr[\"name\"][amenity~\"marketplace|restaurant|cafe|fast_food|food_court\"](around:{self.NEARBY_RADIUS_METRES},{center[0]},{center[1]});
+        );
+        out center tags 120;
+        """
+        try:
+            with httpx.Client(timeout=90.0, headers=self._osm_headers()) as client:
+                response = client.post(settings.overpass_url, data={"data": query})
+                response.raise_for_status()
+                elements = response.json().get("elements", [])
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Discover OSM lookup failed: %s", exc)
+            return []
+
+        places: list[DiscoveryPlace] = []
+        seen: set[str] = set()
+        for element in elements:
+            tags = element.get("tags") or {}
+            name = tags.get("name")
+            coordinate = OpenStreetMapPlaceProvider._element_coordinate(element)
+            if not isinstance(name, str) or not name.strip() or not coordinate:
+                continue
+            if not OpenStreetMapPlaceProvider._is_public(tags):
+                continue
+            latitude, longitude = coordinate
+            key = name.strip().casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            place_type = OpenStreetMapPlaceProvider._place_type(tags)
+            distance = int(round(haversine_metres(center, coordinate)))
+            places.append(
+                DiscoveryPlace(
+                    provider="openstreetmap",
+                    provider_id=f"osm:{element.get('type')}:{element.get('id')}",
+                    name=name.strip(),
+                    place_type=place_type,
+                    latitude=latitude,
+                    longitude=longitude,
+                    distance_metres=distance,
+                    trip_kind="nearby" if distance <= 5_000 else "city",
+                    cuisines=self._split_values(tags.get("cuisine")),
+                )
+            )
+        places.sort(key=lambda place: (place.distance_metres, place.name.casefold()))
+        return places[:40]
+
+    def _wikidata_landmarks(self, center: tuple[float, float]) -> list[DiscoveryPlace]:
+        query = """
+        SELECT ?item ?itemLabel ?coord ?description ?article ?image ?sitelinks WHERE {
+          SERVICE wikibase:around {
+            ?item wdt:P625 ?coord .
+            bd:serviceParam wikibase:center "Point(%(lon)s %(lat)s)"^^geo:wktLiteral .
+            bd:serviceParam wikibase:radius "150" .
+          }
+          ?item wdt:P31/wdt:P279* ?type .
+          VALUES ?type { wd:Q4989906 wd:Q570116 wd:Q839954 wd:Q35509 wd:Q16970 wd:Q23413 wd:Q16560 wd:Q22698 }
+          OPTIONAL { ?item schema:description ?description FILTER(LANG(?description) = "en") }
+          OPTIONAL { ?article schema:about ?item; schema:isPartOf <https://en.wikipedia.org/> }
+          OPTIONAL { ?item wdt:P18 ?image }
+          OPTIONAL { SELECT ?item (COUNT(?link) AS ?sitelinks) WHERE { ?link schema:about ?item } GROUP BY ?item }
+          SERVICE wikibase:label { bd:serviceParam wikibase:language "en" . }
+        }
+        ORDER BY DESC(?sitelinks)
+        LIMIT 60
+        """
+        try:
+            with httpx.Client(
+                timeout=30.0,
+                headers={
+                    "Accept": "application/sparql-results+json",
+                    "User-Agent": settings.osm_user_agent,
+                },
+            ) as client:
+                response = client.get(
+                    settings.wikidata_sparql_url,
+                    params={
+                        "query": query % {"lat": center[0], "lon": center[1]},
+                        "format": "json",
+                    },
+                )
+                response.raise_for_status()
+                rows = response.json().get("results", {}).get("bindings", [])
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Discover Wikidata lookup failed: %s", exc)
+            return []
+
+        places: list[DiscoveryPlace] = []
+        for row in rows:
+            coordinate = self._wikidata_coordinate(row.get("coord", {}).get("value"))
+            item_url = row.get("item", {}).get("value")
+            name = row.get("itemLabel", {}).get("value")
+            if (
+                not coordinate
+                or not isinstance(item_url, str)
+                or not isinstance(name, str)
+            ):
+                continue
+            distance = int(round(haversine_metres(center, coordinate)))
+            if distance > self.DAY_TRIP_RADIUS_METRES:
+                continue
+            places.append(
+                DiscoveryPlace(
+                    provider="wikidata",
+                    provider_id=item_url.rsplit("/", 1)[-1],
+                    name=name,
+                    place_type="landmark",
+                    latitude=coordinate[0],
+                    longitude=coordinate[1],
+                    distance_metres=distance,
+                    trip_kind="day_trip"
+                    if distance > self.NEARBY_RADIUS_METRES
+                    else "city",
+                    description=row.get("description", {}).get("value"),
+                    image_url=row.get("image", {}).get("value"),
+                    external_url=row.get("article", {}).get("value"),
+                )
+            )
+        return places
+
+    def _google_food(
+        self, city: str, center: tuple[float, float], food_query: str | None
+    ) -> tuple[list[DiscoveryPlace], bool]:
+        if not settings.google_places_key:
+            return [], False
+        query = (
+            f"{food_query.strip()} in {city}"
+            if food_query and food_query.strip()
+            else f"popular restaurants in {city}"
+        )
+        try:
+            with httpx.Client(timeout=20.0) as client:
+                response = client.post(
+                    "https://places.googleapis.com/v1/places:searchText",
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Goog-Api-Key": settings.google_places_key,
+                        "X-Goog-FieldMask": "places.id,places.displayName,places.location,places.primaryType,places.rating,places.userRatingCount,places.currentOpeningHours.openNow,places.formattedAddress,places.googleMapsUri,places.types",
+                    },
+                    json={
+                        "textQuery": query,
+                        "locationBias": {
+                            "circle": {
+                                "center": {
+                                    "latitude": center[0],
+                                    "longitude": center[1],
+                                },
+                                "radius": 15000.0,
+                            }
+                        },
+                        "maxResultCount": 20,
+                    },
+                )
+                response.raise_for_status()
+                rows = response.json().get("places", [])
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Discover Google Places lookup failed: %s", exc)
+            return [], False
+        places: list[DiscoveryPlace] = []
+        for row in rows:
+            location = row.get("location") or {}
+            name = (row.get("displayName") or {}).get("text")
+            latitude, longitude = location.get("latitude"), location.get("longitude")
+            if (
+                not isinstance(name, str)
+                or not isinstance(latitude, (int, float))
+                or not isinstance(longitude, (int, float))
+            ):
+                continue
+            coordinate = (float(latitude), float(longitude))
+            places.append(
+                DiscoveryPlace(
+                    provider="google_places",
+                    provider_id=str(row.get("id", "")),
+                    name=name,
+                    place_type=str(row.get("primaryType") or "restaurant"),
+                    latitude=coordinate[0],
+                    longitude=coordinate[1],
+                    distance_metres=int(round(haversine_metres(center, coordinate))),
+                    trip_kind="nearby",
+                    description=row.get("formattedAddress"),
+                    external_url=row.get("googleMapsUri"),
+                    rating=row.get("rating")
+                    if isinstance(row.get("rating"), (int, float))
+                    else None,
+                    review_count=row.get("userRatingCount")
+                    if isinstance(row.get("userRatingCount"), int)
+                    else None,
+                    open_now=(row.get("currentOpeningHours") or {}).get("openNow")
+                    if isinstance(
+                        (row.get("currentOpeningHours") or {}).get("openNow"), bool
+                    )
+                    else None,
+                    cuisines=[
+                        value.replace("_", " ")
+                        for value in row.get("types", [])
+                        if isinstance(value, str) and "restaurant" in value
+                    ],
+                )
+            )
+        places.sort(
+            key=lambda place: (
+                -(place.rating or 0),
+                -(place.review_count or 0),
+                place.distance_metres,
+            )
+        )
+        return places, True
+
+    @staticmethod
+    def _split_landmarks(
+        places: list[DiscoveryPlace],
+    ) -> tuple[list[DiscoveryPlace], list[DiscoveryPlace]]:
+        city = [place for place in places if place.trip_kind == "city"]
+        trips = [place for place in places if place.trip_kind == "day_trip"]
+        return city[:20], trips[:20]
+
+    @staticmethod
+    def _split_values(raw: object) -> list[str]:
+        return [value.strip() for value in str(raw or "").split(";") if value.strip()]
+
+    @staticmethod
+    def _wikidata_coordinate(value: object) -> tuple[float, float] | None:
+        if not isinstance(value, str) or not value.startswith("Point("):
+            return None
+        try:
+            longitude, latitude = value.removeprefix("Point(").removesuffix(")").split()
+            return float(latitude), float(longitude)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _as_dict(place: DiscoveryPlace) -> dict[str, object]:
+        return {
+            "provider": place.provider,
+            "provider_id": place.provider_id,
+            "name": place.name,
+            "place_type": place.place_type,
+            "latitude": place.latitude,
+            "longitude": place.longitude,
+            "distance_metres": place.distance_metres,
+            "trip_kind": place.trip_kind,
+            "description": place.description,
+            "image_url": place.image_url,
+            "external_url": place.external_url,
+            "rating": place.rating,
+            "review_count": place.review_count,
+            "open_now": place.open_now,
+            "cuisines": place.cuisines,
+        }
+
+    @staticmethod
+    def _osm_headers() -> dict[str, str]:
+        return {"User-Agent": settings.osm_user_agent, "Accept-Language": "en"}
 
 
 def haversine_metres(
@@ -135,7 +448,7 @@ def search_radius_metres(max_walking_minutes: int, *, factor: float = 1.25) -> i
     """
     return min(
         int(max_walking_minutes * WALKING_METRES_PER_MINUTE * factor),
-        MAX_SEARCH_RADIUS_METRES,
+        8_000,
     )
 
 
@@ -172,37 +485,113 @@ class OpenStreetMapPlaceProvider(PlaceProvider):
         environment_preference: str = "either",
         accessibility_notes: str | None = None,
     ) -> list[PlaceCandidate]:
-        del city, boundary
         requested = set(categories)
         radius = max(200, min(int(radius_metres), MAX_SEARCH_RADIUS_METRES))
-        # Broad public urban places: parks, culture, learning, light fitness, calm streets.
+        logger.info(
+            "Quest place discovery started: provider=overpass categories=%s radius_metres=%s environment=%s wheelchair_filter=%s",
+            sorted(requested),
+            radius,
+            environment_preference,
+            bool(accessibility_notes and "wheelchair" in accessibility_notes.casefold()),
+        )
+        clauses: list[str] = []
+        if "nature" in requested:
+            clauses.extend(
+                [
+                    f'nwr["name"][leisure~"park|garden|playground|nature_reserve"](around:{radius},{center[0]},{center[1]});',
+                    f'nwr["name"][natural~"wood|scrub|heath"](around:{radius},{center[0]},{center[1]});',
+                ]
+            )
+        if "culture" in requested:
+            # Ask for heritage signals first. This avoids filling the response with
+            # generic nearby amenities when a player has chosen history or culture.
+            clauses.extend(
+                [
+                    f'nwr["name"][historic][wikidata](around:{radius},{center[0]},{center[1]});',
+                    f'nwr["name"][historic][wikipedia](around:{radius},{center[0]},{center[1]});',
+                    f'nwr["name"][historic](around:{radius},{center[0]},{center[1]});',
+                    f'nwr["name"][tourism~"museum|attraction|viewpoint"](around:{radius},{center[0]},{center[1]});',
+                    f'nwr["name"][amenity="place_of_worship"][wikidata](around:{radius},{center[0]},{center[1]});',
+                    f'nwr["name"][amenity~"theatre|music_venue|concert_hall|townhall|marketplace"](around:{radius},{center[0]},{center[1]});',
+                ]
+            )
+        if "creativity" in requested:
+            clauses.append(
+                f'nwr["name"][tourism~"gallery|artwork"](around:{radius},{center[0]},{center[1]});'
+            )
+        if "learning" in requested:
+            clauses.append(
+                f'nwr["name"][amenity~"library|community_centre|college|university"](around:{radius},{center[0]},{center[1]});'
+            )
+        if "fitness" in requested:
+            clauses.append(
+                f'nwr["name"][leisure~"sports_centre|fitness_centre|pitch|track"](around:{radius},{center[0]},{center[1]});'
+            )
+        if "mindfulness" in requested:
+            clauses.extend(
+                [
+                    f'nwr["name"][highway~"pedestrian|footway"](around:{radius},{center[0]},{center[1]});',
+                    f'nwr["name"][place~"square"](around:{radius},{center[0]},{center[1]});',
+                ]
+            )
         overpass_query = f"""
-        [out:json][timeout:25];
+        [out:json][timeout:75];
         (
-          nwr["name"][leisure~"park|garden|sports_centre|fitness_centre|pitch|playground|recreation_ground|nature_reserve|track"](around:{radius},{center[0]},{center[1]});
-          nwr["name"][tourism~"museum|gallery|attraction|artwork|viewpoint"](around:{radius},{center[0]},{center[1]});
-          nwr["name"][historic](around:{radius},{center[0]},{center[1]});
-          nwr["name"][amenity~"library|community_centre|arts_centre|place_of_worship|college|university|theatre|townhall|marketplace"](around:{radius},{center[0]},{center[1]});
-          nwr["name"][highway~"pedestrian|footway"](around:{radius},{center[0]},{center[1]});
-          nwr["name"][landuse~"recreation_ground|grass"](around:{radius},{center[0]},{center[1]});
-          nwr["name"][natural~"wood|scrub|heath"](around:{radius},{center[0]},{center[1]});
-          nwr["name"][place~"square"](around:{radius},{center[0]},{center[1]});
+          {''.join(clauses)}
         );
-        out center tags 200;
+        out center tags 300;
         """
+        started_at = time.monotonic()
         try:
-            with httpx.Client(timeout=30.0, headers=self._headers()) as client:
+            with httpx.Client(timeout=90.0, headers=self._headers()) as client:
                 response = client.post(
                     settings.overpass_url, data={"data": overpass_query}
                 )
                 response.raise_for_status()
                 elements = response.json().get("elements", [])
-        except (httpx.HTTPError, ValueError):
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "Quest place discovery failed: provider=overpass status=%s elapsed_ms=%s",
+                exc.response.status_code,
+                round((time.monotonic() - started_at) * 1000),
+            )
+            # Broad multi-category queries can exceed the public Overpass
+            # service's execution budget. Preserve the player's selected limit,
+            # but retry discovery at a reliable radius so route filtering can
+            # still choose places within that limit.
+            if exc.response.status_code in {429, 504} and radius > 50_000:
+                logger.info(
+                    "Retrying quest place discovery with a smaller Overpass radius: requested_radius_metres=%s retry_radius_metres=%s",
+                    radius,
+                    50_000,
+                )
+                return self.candidates(
+                    city,
+                    categories,
+                    center,
+                    boundary,
+                    radius_metres=50_000,
+                    max_walking_minutes=max_walking_minutes,
+                    environment_preference=environment_preference,
+                    accessibility_notes=accessibility_notes,
+                )
             return []
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning(
+                "Quest place discovery failed: provider=overpass error_type=%s elapsed_ms=%s",
+                type(exc).__name__,
+                round((time.monotonic() - started_at) * 1000),
+            )
+            return []
+        logger.info(
+            "Quest place discovery response: provider=overpass status=%s elements=%s elapsed_ms=%s",
+            response.status_code,
+            len(elements) if isinstance(elements, list) else 0,
+            round((time.monotonic() - started_at) * 1000),
+        )
 
         needs_wheelchair = bool(
-            accessibility_notes
-            and "wheelchair" in accessibility_notes.casefold()
+            accessibility_notes and "wheelchair" in accessibility_notes.casefold()
         )
         results: list[PlaceCandidate] = []
         seen_entities: set[str] = set()
@@ -224,9 +613,15 @@ class OpenStreetMapPlaceProvider(PlaceProvider):
                 continue
             place_type = self._place_type(tags)
             environment = self._environment(place_type, tags)
-            if environment_preference == "indoor" and environment == PlaceEnvironment.outdoor:
+            if (
+                environment_preference == "indoor"
+                and environment == PlaceEnvironment.outdoor
+            ):
                 continue
-            if environment_preference == "outdoor" and environment == PlaceEnvironment.indoor:
+            if (
+                environment_preference == "outdoor"
+                and environment == PlaceEnvironment.indoor
+            ):
                 continue
             wheelchair = self._wheelchair(tags)
             if needs_wheelchair and wheelchair == WheelchairStatus.no:
@@ -270,9 +665,41 @@ class OpenStreetMapPlaceProvider(PlaceProvider):
                     distance_metres=distance,
                     walking_minutes=approximate_walking_minutes(distance),
                     distance_source=DistanceSource.approximate,
+                    landmark_rank=self._landmark_rank(tags, category),
                 )
             )
+        results.sort(
+            key=lambda candidate: (
+                candidate.landmark_rank,
+                candidate.distance_metres,
+                candidate.name.casefold(),
+            )
+        )
+        logger.info(
+            "Quest place discovery filtered: provider=overpass eligible_candidates=%s",
+            len(results),
+        )
         return results
+
+    @staticmethod
+    def _landmark_rank(tags: dict, category: str) -> int:
+        """Rank culturally significant, source-backed places before generic venues."""
+        if category != "culture":
+            return 10
+        has_reference = bool(tags.get("wikidata") or tags.get("wikipedia"))
+        historic = tags.get("historic")
+        tourism = tags.get("tourism")
+        if has_reference and (historic or tourism in {"museum", "attraction"}):
+            return 0
+        if historic in {"archaeological_site", "ruins", "castle", "monument", "memorial"}:
+            return 1
+        if tourism in {"museum", "attraction", "viewpoint"}:
+            return 2
+        if historic:
+            return 3
+        if has_reference and tags.get("amenity") == "place_of_worship":
+            return 4
+        return 10
 
     def areas(self, query: str, city: str | None = None) -> list[dict]:
         query = f"{query.strip()} {city.strip()}" if city else query.strip()
@@ -286,9 +713,7 @@ class OpenStreetMapPlaceProvider(PlaceProvider):
         }
         try:
             with httpx.Client(timeout=8.0, headers=self._headers()) as client:
-                response = client.get(
-                    f"{settings.nominatim_url}/search", params=params
-                )
+                response = client.get(f"{settings.nominatim_url}/search", params=params)
                 response.raise_for_status()
                 payload = response.json()
         except (httpx.HTTPError, ValueError):
@@ -341,7 +766,15 @@ class OpenStreetMapPlaceProvider(PlaceProvider):
         if (
             tourism in {"museum", "attraction", "viewpoint"}
             or "historic" in tags
-            or amenity in {"place_of_worship", "theatre", "townhall", "marketplace"}
+            or amenity
+            in {
+                "place_of_worship",
+                "theatre",
+                "music_venue",
+                "concert_hall",
+                "townhall",
+                "marketplace",
+            }
             or place == "square"
         ):
             return "culture"
@@ -518,25 +951,372 @@ def rank_place_candidates(
     return selected
 
 
+SupportedTravelMode = Literal[
+    "walking", "cycling", "two_wheeler", "four_wheeler", "public_transport"
+]
+
+_GOOGLE_TRAVEL_MODES: dict[str, str] = {
+    "walking": "WALK",
+    "cycling": "BICYCLE",
+    "two_wheeler": "TWO_WHEELER",
+    "four_wheeler": "DRIVE",
+    "public_transport": "TRANSIT",
+}
+
+
+class RouteConfigurationError(RuntimeError):
+    """Google Routes is not configured for a request that needs live routing."""
+
+
+class RouteServiceError(RuntimeError):
+    """Google Routes could not authoritatively answer a routing request."""
+
+
+@dataclass(frozen=True)
+class RouteResult:
+    """A verified one-way route. ``None`` denotes an unreachable destination."""
+
+    travel_mode: SupportedTravelMode
+    distance_metres: int
+    duration_seconds: int
+    encoded_polyline: str | None = None
+
+
 class RouteProvider:
-    """OSRM walking-route normalization boundary."""
+    """Authoritative server-side Google Routes boundary.
+
+    This provider intentionally has no estimated or OSRM fallback. A missing
+    result means the destination is ineligible for that mode; a provider error
+    is raised so callers can retain the existing deck and offer a retry.
+    """
+
+    _MATRIX_FIELD_MASK = (
+        "originIndex,destinationIndex,condition,status,distanceMeters,duration"
+    )
+    _ROUTE_FIELD_MASK = (
+        "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline,"
+        "routes.travelAdvisory"
+    )
+
+    @staticmethod
+    def _google_mode(mode: SupportedTravelMode) -> str:
+        try:
+            return _GOOGLE_TRAVEL_MODES[mode]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported travel mode: {mode}") from exc
+
+    @staticmethod
+    def _duration_seconds(value: object) -> int | None:
+        if not isinstance(value, str) or not value.endswith("s"):
+            return None
+        try:
+            seconds = float(value[:-1])
+        except ValueError:
+            return None
+        return max(0, int(round(seconds)))
+
+    @staticmethod
+    def _waypoint(point: tuple[float, float]) -> dict[str, object]:
+        return {"location": {"latLng": {"latitude": point[0], "longitude": point[1]}}}
+
+    def _headers(self, field_mask: str) -> dict[str, str]:
+        if not settings.google_routes_key:
+            raise RouteConfigurationError(
+                "Google Routes is not configured. Set DETOUR_GOOGLE_ROUTES_KEY."
+            )
+        return {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": settings.google_routes_key,
+            "X-Goog-FieldMask": field_mask,
+        }
+
+    @staticmethod
+    def _departure_time(mode: SupportedTravelMode) -> str | None:
+        if mode != "public_transport":
+            return None
+        return (
+            datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
+
+    def matrix(
+        self,
+        origin: tuple[float, float],
+        destinations: list[tuple[float, float]],
+        *,
+        travel_mode: SupportedTravelMode,
+    ) -> list[RouteResult | None]:
+        """Return verified routes in destination order; ``None`` means no route.
+
+        Raises ``RouteConfigurationError`` for a missing key and
+        ``RouteServiceError`` for unavailable or malformed provider responses.
+        Coordinates are deliberately never included in logs or exception text.
+        """
+        if not destinations:
+            logger.info(
+                "Google Routes matrix skipped: mode=%s reason=no_destinations",
+                travel_mode,
+            )
+            return []
+        batch_limit = 100 if travel_mode == "public_transport" else 625
+        if len(destinations) > batch_limit:
+            combined: list[RouteResult | None] = []
+            for start in range(0, len(destinations), batch_limit):
+                combined.extend(
+                    self.matrix(
+                        origin,
+                        destinations[start : start + batch_limit],
+                        travel_mode=travel_mode,
+                    )
+                )
+            return combined
+        mode = self._google_mode(travel_mode)
+        payload: dict[str, object] = {
+            "origins": [{"waypoint": self._waypoint(origin)}],
+            "destinations": [
+                {"waypoint": self._waypoint(point)} for point in destinations
+            ],
+            "travelMode": mode,
+        }
+        departure_time = self._departure_time(travel_mode)
+        if departure_time:
+            payload["departureTime"] = departure_time
+        logger.info(
+            "Google Routes matrix started: mode=%s destinations=%s timeout_seconds=%s",
+            travel_mode,
+            len(destinations),
+            settings.google_routes_timeout_seconds,
+        )
+        started_at = time.monotonic()
+        try:
+            with httpx.Client(timeout=settings.google_routes_timeout_seconds) as client:
+                response = client.post(
+                    f"{settings.google_routes_url}/distanceMatrix/v2:computeRouteMatrix",
+                    headers=self._headers(self._MATRIX_FIELD_MASK),
+                    json=payload,
+                )
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403):
+                logger.warning(
+                    "Google Routes matrix authorization failed: mode=%s status=%s elapsed_ms=%s",
+                    travel_mode,
+                    exc.response.status_code,
+                    round((time.monotonic() - started_at) * 1000),
+                )
+                raise RouteConfigurationError(
+                    "Google Routes credentials are invalid or not authorized."
+                ) from exc
+            logger.warning(
+                "Google Routes matrix request failed: mode=%s status=%s elapsed_ms=%s",
+                travel_mode,
+                exc.response.status_code,
+                round((time.monotonic() - started_at) * 1000),
+            )
+            raise RouteServiceError(
+                "Google Routes is temporarily unavailable."
+            ) from exc
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Google Routes matrix request failed: mode=%s error_type=%s elapsed_ms=%s",
+                travel_mode,
+                type(exc).__name__,
+                round((time.monotonic() - started_at) * 1000),
+            )
+            raise RouteServiceError(
+                "Google Routes is temporarily unavailable."
+            ) from exc
+
+        results: list[RouteResult | None] = [None] * len(destinations)
+        try:
+            decoded = response.json()
+            if isinstance(decoded, list):
+                rows = decoded
+            elif isinstance(decoded, dict):
+                rows = [decoded]
+            else:
+                raise ValueError
+        except ValueError:
+            try:
+                rows = [
+                    json.loads(line)
+                    for line in response.text.splitlines()
+                    if line.strip()
+                ]
+            except ValueError as exc:
+                raise RouteServiceError(
+                    "Google Routes returned an invalid matrix response."
+                ) from exc
+        if not rows:
+            raise RouteServiceError("Google Routes returned an empty matrix response.")
+        logger.info(
+            "Google Routes matrix response: mode=%s status=%s rows=%s elapsed_ms=%s",
+            travel_mode,
+            response.status_code,
+            len(rows),
+            round((time.monotonic() - started_at) * 1000),
+        )
+        for row in rows:
+            if not isinstance(row, dict):
+                raise RouteServiceError("Google Routes returned an invalid matrix row.")
+            index = row.get("destinationIndex")
+            if not isinstance(index, int) or not 0 <= index < len(destinations):
+                raise RouteServiceError(
+                    "Google Routes returned an invalid matrix index."
+                )
+            condition = row.get("condition")
+            if condition == "ROUTE_NOT_FOUND":
+                continue
+            status = row.get("status")
+            if isinstance(status, dict) and status.get("code", 0) not in (0, None):
+                # An individual route failure is not evidence of reachability.
+                continue
+            distance = row.get("distanceMeters")
+            duration = self._duration_seconds(row.get("duration"))
+            if (
+                condition not in (None, "ROUTE_EXISTS")
+                or not isinstance(distance, (int, float))
+                or duration is None
+            ):
+                continue
+            results[index] = RouteResult(
+                travel_mode=travel_mode,
+                distance_metres=max(0, int(round(distance))),
+                duration_seconds=duration,
+            )
+        logger.info(
+            "Google Routes matrix parsed: mode=%s routable=%s unroutable=%s",
+            travel_mode,
+            sum(result is not None for result in results),
+            sum(result is None for result in results),
+        )
+        return results
+
+    def matrix_with_fallbacks(
+        self,
+        origin: tuple[float, float],
+        destinations: list[tuple[float, float]],
+        *,
+        travel_modes: list[SupportedTravelMode],
+    ) -> list[RouteResult | None]:
+        """Route in preference order, querying backups only for unresolved places."""
+        if not travel_modes:
+            raise ValueError("At least one travel mode is required.")
+        if len(set(travel_modes)) != len(travel_modes):
+            raise ValueError("Travel modes must not contain duplicates.")
+        resolved: list[RouteResult | None] = [None] * len(destinations)
+        unresolved = list(range(len(destinations)))
+        for mode in travel_modes:
+            if not unresolved:
+                break
+            partial = self.matrix(
+                origin,
+                [destinations[index] for index in unresolved],
+                travel_mode=mode,
+            )
+            next_unresolved: list[int] = []
+            for index, result in zip(unresolved, partial, strict=True):
+                if result is None:
+                    next_unresolved.append(index)
+                else:
+                    resolved[index] = result
+            unresolved = next_unresolved
+        return resolved
+
+    def route(
+        self,
+        origin: tuple[float, float],
+        destination: tuple[float, float],
+        *,
+        travel_mode: SupportedTravelMode,
+    ) -> RouteResult | None:
+        """Return one Google Compute Routes result for map previews."""
+        mode = self._google_mode(travel_mode)
+        payload: dict[str, object] = {
+            "origin": self._waypoint(origin),
+            "destination": self._waypoint(destination),
+            "travelMode": mode,
+            "computeAlternativeRoutes": False,
+        }
+        departure_time = self._departure_time(travel_mode)
+        if departure_time:
+            payload["departureTime"] = departure_time
+        try:
+            with httpx.Client(timeout=settings.google_routes_timeout_seconds) as client:
+                response = client.post(
+                    f"{settings.google_routes_url}/directions/v2:computeRoutes",
+                    headers=self._headers(self._ROUTE_FIELD_MASK),
+                    json=payload,
+                )
+                response.raise_for_status()
+                route_payload = response.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403):
+                logger.warning(
+                    "Google Routes preview authorization failed: status=%s",
+                    exc.response.status_code,
+                )
+                raise RouteConfigurationError(
+                    "Google Routes credentials are invalid or not authorized."
+                ) from exc
+            logger.warning(
+                "Google Routes preview request failed: status=%s",
+                exc.response.status_code,
+            )
+            raise RouteServiceError(
+                "Google Routes is temporarily unavailable."
+            ) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning(
+                "Google Routes preview request failed: %s", type(exc).__name__
+            )
+            raise RouteServiceError(
+                "Google Routes is temporarily unavailable."
+            ) from exc
+        if not isinstance(route_payload, dict):
+            raise RouteServiceError("Google Routes returned an invalid route response.")
+        routes = route_payload.get("routes")
+        if not isinstance(routes, list) or not routes:
+            return None
+        first = routes[0]
+        if not isinstance(first, dict):
+            raise RouteServiceError("Google Routes returned an invalid route response.")
+        distance = first.get("distanceMeters")
+        duration = self._duration_seconds(first.get("duration"))
+        if not isinstance(distance, (int, float)) or duration is None:
+            return None
+        polyline = first.get("polyline")
+        encoded_polyline = (
+            polyline.get("encodedPolyline")
+            if isinstance(polyline, dict)
+            and isinstance(polyline.get("encodedPolyline"), str)
+            else None
+        )
+        return RouteResult(
+            travel_mode=travel_mode,
+            distance_metres=max(0, int(round(distance))),
+            duration_seconds=duration,
+            encoded_polyline=encoded_polyline,
+        )
 
     def summary(
         self, origin: tuple[float, float], destination: tuple[float, float]
     ) -> dict:
-        matrix = self.walking_matrix(origin, [destination])
-        if not matrix:
-            return {"walking": {"available": False}, "transit": {"available": False}}
-        distance, duration = matrix[0]
-        if distance is None or duration is None:
-            return {"walking": {"available": False}, "transit": {"available": False}}
+        """Compatibility summary for existing callers, now backed by Google Routes."""
+        walking = self.route(origin, destination, travel_mode="walking")
+        transit = self.route(origin, destination, travel_mode="public_transport")
         return {
-            "walking": {
-                "available": True,
-                "distance_metres": distance,
-                "duration_seconds": duration,
-            },
-            "transit": {"available": False},
+            "walking": self._summary_value(walking),
+            "transit": self._summary_value(transit),
+        }
+
+    @staticmethod
+    def _summary_value(result: RouteResult | None) -> dict[str, int | bool]:
+        if result is None:
+            return {"available": False}
+        return {
+            "available": True,
+            "distance_metres": result.distance_metres,
+            "duration_seconds": result.duration_seconds,
         }
 
     def walking_matrix(
@@ -544,64 +1324,27 @@ class RouteProvider:
         origin: tuple[float, float],
         destinations: list[tuple[float, float]],
     ) -> list[tuple[float | None, float | None]]:
-        """Return (distance_metres, duration_seconds) per destination; None on miss."""
-        if not destinations:
-            return []
-        # OSRM table: lon,lat;lon,lat...
-        coords = [f"{origin[1]},{origin[0]}"] + [
-            f"{lon},{lat}" for lat, lon in destinations
+        """Legacy walking matrix adapter backed by authoritative Google routes."""
+        return [
+            (result.distance_metres, result.duration_seconds)
+            if result is not None
+            else (None, None)
+            for result in self.matrix(origin, destinations, travel_mode="walking")
         ]
-        coord_path = ";".join(coords)
-        destinations_idx = ";".join(str(i) for i in range(1, len(coords)))
-        url = (
-            f"{settings.osrm_base_url}/table/v1/driving/{coord_path}"
-            f"?sources=0&destinations={destinations_idx}&annotations=distance,duration"
-        )
-        try:
-            with httpx.Client(timeout=12.0) as client:
-                response = client.get(url)
-                response.raise_for_status()
-                payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("OSRM table request failed: %s", exc)
-            return [(None, None)] * len(destinations)
-
-        distances = payload.get("distances") or []
-        durations = payload.get("durations") or []
-        if not distances or not durations:
-            return [(None, None)] * len(destinations)
-        row_d = distances[0] if distances else []
-        row_t = durations[0] if durations else []
-        results: list[tuple[float | None, float | None]] = []
-        for index in range(len(destinations)):
-            distance = row_d[index] if index < len(row_d) else None
-            duration = row_t[index] if index < len(row_t) else None
-            if (
-                isinstance(distance, (int, float))
-                and isinstance(duration, (int, float))
-                and distance >= 0
-                and duration >= 0
-            ):
-                results.append((float(distance), float(duration)))
-            else:
-                results.append((None, None))
-        return results
 
 
 def enrich_with_walking_routes(
     origin: tuple[float, float],
     candidates: list[PlaceCandidate],
     *,
-    max_walking_minutes: int,
+    max_walking_minutes: int | None,
     categories: list[str],
 ) -> list[PlaceCandidate]:
-    """Hybrid distance: approximate all, route best 24, keep within walking budget."""
+    """Keep only candidates with a verified walking route (legacy adapter)."""
     if not candidates:
         return []
 
-    shortlist = rank_place_candidates(
-        candidates, categories, limit=OSRM_MATRIX_LIMIT
-    )
+    shortlist = rank_place_candidates(candidates, categories, limit=OSRM_MATRIX_LIMIT)
     router = RouteProvider()
     matrix = router.walking_matrix(
         origin, [(c.latitude, c.longitude) for c in shortlist]
@@ -611,15 +1354,9 @@ def enrich_with_walking_routes(
     for candidate, pair in zip(shortlist, matrix, strict=False):
         distance, duration = pair
         if distance is None or duration is None:
-            # OSRM miss — keep approximate if still within preference.
-            if candidate.walking_minutes <= max_walking_minutes:
-                routed[candidate.provider_id] = candidate
             continue
         walking_minutes = max(1, int(math.ceil(duration / 60.0)))
-        if walking_minutes > max_walking_minutes:
-            # Routed over budget: keep approximate only if crow-flies estimate fits.
-            if candidate.walking_minutes <= max_walking_minutes:
-                routed[candidate.provider_id] = candidate
+        if max_walking_minutes is not None and walking_minutes > max_walking_minutes:
             continue
         routed[candidate.provider_id] = replace(
             candidate,
@@ -628,25 +1365,20 @@ def enrich_with_walking_routes(
             distance_source=DistanceSource.walking_route,
         )
 
-    # Merge: prefer routed shortlist entries; keep approximate non-shortlist within budget.
+    # Only matrix-shortlisted destinations have verified route data.
     final: list[PlaceCandidate] = []
     seen: set[str] = set()
     for candidate in shortlist:
         updated = routed.get(candidate.provider_id)
         if updated is None:
             continue
-        if updated.walking_minutes > max_walking_minutes:
+        if (
+            max_walking_minutes is not None
+            and updated.walking_minutes > max_walking_minutes
+        ):
             continue
         final.append(updated)
         seen.add(updated.provider_id)
-
-    for candidate in candidates:
-        if candidate.provider_id in seen:
-            continue
-        if candidate.walking_minutes > max_walking_minutes:
-            continue
-        final.append(candidate)
-        seen.add(candidate.provider_id)
 
     final.sort(key=lambda c: (c.walking_minutes, c.distance_metres, c.name.casefold()))
     return final
@@ -702,9 +1434,11 @@ class OpenRouterQuestGenerator:
             },
         }
         logger.info(
-            "Sending OpenRouter quest request: model=%s timeout_seconds=%s",
+            "Sending OpenRouter quest request: model=%s timeout_seconds=%s prompt_bytes=%s schema_keys=%s",
             settings.openrouter_quest_model,
             settings.openrouter_timeout_seconds,
+            len(user.encode("utf-8")),
+            sorted(schema.keys()),
         )
         started_at = time.monotonic()
         with httpx.Client(
@@ -715,10 +1449,11 @@ class OpenRouterQuestGenerator:
                 json=body,
             )
             logger.info(
-                "Received OpenRouter quest response: model=%s status_code=%s elapsed_ms=%s",
+                "Received OpenRouter quest response: model=%s status_code=%s elapsed_ms=%s response_bytes=%s",
                 settings.openrouter_quest_model,
                 response.status_code,
                 round((time.monotonic() - started_at) * 1000),
+                len(response.content),
             )
             response.raise_for_status()
             payload = response.json()
@@ -740,9 +1475,12 @@ class OpenRouterQuestGenerator:
 
         batch = GeneratedQuestBatch.model_validate_json(text)
         logger.info(
-            "Validated OpenRouter quest response: model=%s quests=%s",
+            "Validated OpenRouter quest response: model=%s quests=%s candidate_ids=%s categories=%s difficulties=%s",
             settings.openrouter_quest_model,
             len(batch.quests),
+            [quest.candidate_id for quest in batch.quests],
+            [quest.category.value for quest in batch.quests],
+            [quest.difficulty.value for quest in batch.quests],
         )
         return batch
 
