@@ -8,11 +8,12 @@ Detour is a mobile-first, honor-system PWA for personalized real-world quests. P
 - `api/`: FastAPI + Python, managed with UV
 - SQLite for the runnable local MVP, behind a persistence boundary intended for PostgreSQL/PostGIS
 - Provider boundaries for Redis and Dramatiq background generation
-- MapLibre with OpenStreetMap tiles, Nominatim search, Overpass places, and OSRM walking routes
-- Google Routes for best-effort public-transit summaries
+- MapLibre with OpenStreetMap tiles, Nominatim search, and Overpass places
+- Google Routes for verified travel times and route previews across every supported mode
+- Google Places plus Wikidata for live Discover food venues and landmark context
 - OpenRouter for structured quest personalization
 
-There is intentionally no proof upload, camera access, completion-location verification, or verifier service. Quest completion is an irreversible honor-system action. During home setup, a player can explicitly choose to save their current device location as home. Later device-location use stays in browser memory and is sent directly to the configured OSRM service only after the player requests a walking-route preview.
+There is intentionally no proof upload, camera access, completion-location verification, or verifier service. Quest completion is an irreversible honor-system action. During home setup, a player can explicitly choose to save their current device location as home. Later device-location use stays in browser memory and is sent to the authenticated API only after the player requests a route preview. Travel preferences support walking, cycling, two-wheelers, four-wheelers, and public transport. Running is an activity style, not a travel mode.
 
 Authentication is currently bypassed by default so the local app opens directly to the quest map. Set `NEXT_PUBLIC_AUTH_DISABLED=false` in `web/.env.local` to restore registration and login.
 
@@ -81,11 +82,14 @@ Root `.env` is for local coordination only. Package-specific runtime configurati
 | `NEXT_PUBLIC_API_BASE_URL` | Yes for web | Browser API base URL, normally `http://localhost:8000`. |
 | `NEXT_PUBLIC_GAME_MAP_TILEJSON_URL` | Optional | OpenMapTiles-compatible TileJSON source for the illustrated, label-free gameplay map. Defaults to OpenFreeMap's planet source. |
 | `NEXT_PUBLIC_OSM_TILE_URL` | Optional | OSM-compatible raster tile template. Defaults to the public OSM tile service for local development. |
-| `NEXT_PUBLIC_OSRM_BASE_URL` | Optional | OSRM endpoint for player-requested walking previews. |
 | `DETOUR_NOMINATIM_URL` | Optional | Nominatim endpoint for address search. |
 | `DETOUR_OVERPASS_URL` | Optional | Overpass endpoint for nearby public places. |
 | `DETOUR_OSM_USER_AGENT` | Yes for API | Identifies the application and provides a real contact for OSM services. |
-| `GOOGLE_MAPS_API_KEY` | Optional | Google Routes API key for transit summaries. |
+| `DETOUR_GOOGLE_ROUTES_KEY` | Yes for generated decks | Server-only Google Routes API key for verified matching and previews. |
+| `DETOUR_GOOGLE_ROUTES_URL` | Optional | Google Routes API base URL. |
+| `DETOUR_GOOGLE_ROUTES_TIMEOUT_SECONDS` | Optional | Google Routes request timeout in seconds. |
+| `DETOUR_GOOGLE_PLACES_KEY` | Optional | Server-only Google Places API key for live food discovery. Enable Places API (New), restrict the key, and never expose it to the browser. Without it, Discover still returns OSM/Wikidata places and shows food as unavailable. |
+| `DETOUR_WIKIDATA_SPARQL_URL` | Optional | Wikidata Query Service endpoint used for regional landmark discovery. |
 | `OPENROUTER_API_KEY` | Yes for generated decks | OpenRouter key. Never expose to the browser. |
 | `OPENROUTER_QUEST_MODEL` | Yes for generated decks | Structured-output-capable OpenRouter model ID. |
 | `JWT_SECRET` | Yes for API | High-entropy signing secret. |
@@ -96,9 +100,9 @@ Use separate restricted provider credentials for local development. Never place 
 
 ## Map behavior
 
-The Map tab uses MapLibre with a configurable OpenMapTiles-compatible vector source for a pitched, illustrated, label-free game world that can expand into a full-screen exploration view. It keeps visible OpenStreetMap attribution. The home area picker deliberately remains a conventional MapLibre raster map using `NEXT_PUBLIC_OSM_TILE_URL`. Quest beacons, status changes, player location, and OSRM walking previews are display features only and never gate completion. Both maps retain a stylized fallback if their configured tile service cannot load.
+The Map tab uses MapLibre with a configurable OpenMapTiles-compatible vector source for a pitched, illustrated, label-free game world that can expand into a full-screen exploration view. It keeps visible OpenStreetMap attribution. The home area picker deliberately remains a conventional MapLibre raster map using `NEXT_PUBLIC_OSM_TILE_URL`. Quest matching and previews use Google Routes for walking, cycling, two-wheelers, four-wheelers, and public transport. Quest beacons, status changes, player location, and route previews are display features only and never gate completion. Both maps retain a stylized fallback if their configured tile service cannot load.
 
-The public OpenStreetMap, Nominatim, Overpass, and OSRM endpoints are development defaults, not an unlimited production backend. Use hosted or self-hosted endpoints, retain visible OpenStreetMap attribution, identify server requests, cache responsibly, and follow each service's usage policy.
+The public OpenStreetMap, Nominatim, and Overpass endpoints are development defaults, not an unlimited production backend. Use hosted or self-hosted endpoints, retain visible OpenStreetMap attribution, identify server requests, cache responsibly, and follow each service's usage policy.
 
 Home setup accepts a searched address, a map-pinned point, or the device's live location after explicit browser permission. The chosen home label, input method, exact point, and server-derived resolution-7 H3 zone are stored on the player's account. No location is collected in the background and completion locations are never stored.
 
