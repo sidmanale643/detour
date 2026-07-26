@@ -14,6 +14,8 @@ export interface AreaPickerMapProps {
 
 export default function AreaPickerMap({ selected, onSelect, className }: AreaPickerMapProps) {
   const initialCenter = useMemo(() => selected, [selected]);
+  const selectedLongitude = selected?.longitude ?? null;
+  const selectedLatitude = selected?.latitude ?? null;
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const markerRef = useRef<Marker | null>(null);
@@ -46,22 +48,22 @@ export default function AreaPickerMap({ selected, onSelect, className }: AreaPic
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!mapReady || !map || !selected) return;
+    if (!mapReady || !map || selectedLongitude == null || selectedLatitude == null) return;
     void import("maplibre-gl").then(({ default: maplibregl }) => {
       markerRef.current?.remove();
       const element = document.createElement("div");
       element.className = styles.marker;
       element.setAttribute("aria-label", "Selected home zone");
       element.innerHTML = "<span>⌂</span>";
-      const marker = new maplibregl.Marker({ element, anchor: "bottom", draggable: true }).setLngLat([selected.longitude, selected.latitude]).addTo(map);
+      const marker = new maplibregl.Marker({ element, anchor: "bottom", draggable: true }).setLngLat([selectedLongitude, selectedLatitude]).addTo(map);
       marker.on("dragend", () => {
         const point = marker.getLngLat();
         onSelectRef.current({ latitude: point.lat, longitude: point.lng });
       });
       markerRef.current = marker;
-      map.easeTo({ center: [selected.longitude, selected.latitude], duration: 350 });
+      map.easeTo({ center: [selectedLongitude, selectedLatitude], duration: 350 });
     });
-  }, [mapReady, selected]);
+  }, [mapReady, selectedLatitude, selectedLongitude]);
 
   return <section className={`${styles.shell} ${className ?? ""}`} aria-label="Choose your approximate home zone">
     {!initialCenter ? <div className={styles.empty}>Search for an address or use your live location to load the map.</div> : mapFailed ? <div className={styles.empty}>Map tiles are unavailable. Try again later.</div> : <div ref={mapContainerRef} className={styles.map} />}

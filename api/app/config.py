@@ -31,15 +31,11 @@ _load_dotenv()
 
 @dataclass(frozen=True)
 class Settings:
-    database_url: str = os.getenv(
-        "DETOUR_DATABASE_URL", "sqlite:///./data/detour.db"
-    )
+    database_url: str = os.getenv("DETOUR_DATABASE_URL", "sqlite:///./data/detour.db")
     secret_key: str = os.getenv("DETOUR_SECRET_KEY", "development-only-change-me")
     access_token_minutes: int = int(os.getenv("DETOUR_ACCESS_TOKEN_MINUTES", "30"))
     refresh_token_days: int = int(os.getenv("DETOUR_REFRESH_TOKEN_DAYS", "30"))
-    cookie_secure: bool = (
-        os.getenv("DETOUR_COOKIE_SECURE", "false").lower() == "true"
-    )
+    cookie_secure: bool = os.getenv("DETOUR_COOKIE_SECURE", "false").lower() == "true"
     nominatim_url: str = os.getenv(
         "DETOUR_NOMINATIM_URL", "https://nominatim.openstreetmap.org"
     ).rstrip("/")
@@ -51,6 +47,16 @@ class Settings:
         "Detour/0.1 (+https://github.com/detour; contact: maps@detour.local)",
     )
     google_routes_key: str | None = os.getenv("DETOUR_GOOGLE_ROUTES_KEY")
+    google_routes_url: str = os.getenv(
+        "DETOUR_GOOGLE_ROUTES_URL", "https://routes.googleapis.com"
+    ).rstrip("/")
+    google_routes_timeout_seconds: float = float(
+        os.getenv("DETOUR_GOOGLE_ROUTES_TIMEOUT_SECONDS", "15")
+    )
+    google_places_key: str | None = os.getenv("DETOUR_GOOGLE_PLACES_KEY")
+    wikidata_sparql_url: str = os.getenv(
+        "DETOUR_WIKIDATA_SPARQL_URL", "https://query.wikidata.org/sparql"
+    ).rstrip("/")
     osrm_base_url: str = os.getenv(
         "DETOUR_OSRM_BASE_URL",
         os.getenv(
@@ -58,9 +64,9 @@ class Settings:
             "https://routing.openstreetmap.de/routed-foot",
         ),
     ).rstrip("/")
-    openrouter_api_key: str | None = (
-        os.getenv("DETOUR_OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-    )
+    openrouter_api_key: str | None = os.getenv(
+        "DETOUR_OPENROUTER_API_KEY"
+    ) or os.getenv("OPENROUTER_API_KEY")
     openrouter_base_url: str = os.getenv(
         "DETOUR_OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
     ).rstrip("/")
@@ -76,9 +82,7 @@ class Settings:
     )
     openrouter_app_name: str = os.getenv("DETOUR_OPENROUTER_APP_NAME", "Detour")
     # When true, POST /v1/auth/dev-session may mint a local explorer session.
-    auth_disabled: bool = (
-        os.getenv("DETOUR_AUTH_DISABLED", "true").lower() == "true"
-    )
+    auth_disabled: bool = os.getenv("DETOUR_AUTH_DISABLED", "true").lower() == "true"
     redis_url: str | None = os.getenv("DETOUR_REDIS_URL")
 
     @property

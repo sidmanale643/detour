@@ -1,4 +1,4 @@
-"""Quest generation via OpenRouter: prompt, validate, safety, diversity, place binding."""
+"""Quest generation via OpenRouter with schema validation and place binding."""
 
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ from ..schemas.quests import (
     PlaceCandidateIn,
     PlaceEnvironment,
     QuestGenerationRequest,
-    SocialComfort,
 )
 
 # Uvicorn configures this logger for application-visible INFO logs by default.
@@ -31,49 +30,16 @@ class QuestGenerationError(Exception):
 
 
 SYSTEM_PROMPT = """\
-You generate real-world urban quests for Detour, a walkable city exploration app.
+You generate real-world urban quests for Detour, a city exploration app.
 
-## Safety and legality (hard)
-- Legal for an adult in a public urban setting only.
-- Never dangerous, illegal, or fatal: no weapons, trespass, private property intrusion, \
-traffic stunts, unprotected heights/cliffs, swimming/ice risks, substance use, self-harm, \
-confrontation, theft, vandalism, railway tracks, rooftops, or hitchhiking.
-- No medical claims, therapy claims, or physical prescriptions.
-- No required purchase, proof upload, booking, photography mandate, journaling mandate, \
-or required stranger interaction.
-- Prefer free public activities. cost_band must be "free" or "low" and must respect the \
-profile budget (if budget is "free", only free).
+Create the requested number of creative quests from the supplied context.
+Treat interests as subject matter, intent as the desired outcome, activity style
+as what the player wants to do, and travel mode only as verified logistics.
+Prefer loved interests, never use avoided interests, prioritize the primary
+intent over secondary intents, and use only a selected activity style.
 
-## Hard constraints vs preferences
-- Hard: legality, safety, public access, candidate binding, budget, social comfort, \
-time budget (one-way walking_minutes + estimated_activity_minutes must fit available_minutes), \
-environment preference when the place environment is known.
-- Preferences: motivations, interests (likes), dislikes as soft exclusions, movement intensity.
-
-## Exact candidate binding
-- Every quest MUST set candidate_id to one of the provided place_candidates.candidate_id values.
-- Never invent a place. Never use place names as IDs.
-- Use only verified_features listed for that candidate. Do not invent amenities, hours, \
-entry fees, events, or opening status.
-- Do not assume a place is open right now.
-
-## Activity quality
-- Clear primary action and a recognizable completion point the player can honor-system mark done.
-- Location-specific rather than generic: reference the place type and verified features only.
-- Solo-friendly when social_comfort is solo_only (no required talking to strangers or staff).
-- Optional interaction is allowed only when social_comfort is optional_interaction.
-- Match movement_intensity: gentle = calm easy activities; moderate = some movement; \
-energetic = more active movement. Never force hard intensity on gentle users.
-- Respect accessibility_notes when present (e.g. avoid stairs-heavy wording if noted).
-
-## Batch diversity (when count > 1)
-- Distinct candidate_id values.
-- Distinct activity_type values (e.g. observe, walk, sketch, learn, breathe, move).
-- Distinct titles.
-- Spread categories across available candidates when possible.
-- Prefer a mix of difficulties when count >= 3 (not all hard).
-
-Return only structured data matching the schema. Be creative but safe and grounded.
+Use a candidate_id from the provided place_candidates. Return only structured data
+matching the schema.
 """
 
 _SAFETY_BLOCKLIST = re.compile(
@@ -148,7 +114,9 @@ def is_safe_text(title: str, description: str) -> bool:
     return True
 
 
-def requires_stranger_interaction(title: str, description: str, activity_type: str) -> bool:
+def requires_stranger_interaction(
+    title: str, description: str, activity_type: str
+) -> bool:
     blob = f"{title}\n{description}\n{activity_type}"
     return bool(_STRANGER_INTERACTION.search(blob))
 
@@ -198,7 +166,8 @@ def accessibility_contradicted(
     if "wheelchair" in notes_cf and wheelchair == "no":
         return True
     if "wheelchair" in notes_cf and any(
-        token in blob for token in ("stairs only", "many stairs", "climb stairs", "uneven rocky")
+        token in blob
+        for token in ("stairs only", "many stairs", "climb stairs", "uneven rocky")
     ):
         return True
     if "no stairs" in notes_cf and "stairs" in blob:
@@ -233,9 +202,26 @@ def build_user_prompt(
                 "name": place.name,
                 "place_type": place.place_type,
                 "category": place.category.value,
-                "distance_metres": place.distance_metres,
-                "walking_minutes": place.walking_minutes,
-                "distance_source": place.distance_source.value,
+                "topics": [topic.value for topic in place.topics],
+                "travel_mode": (
+                    place.travel_mode.value
+                    if place.travel_mode
+                    else (
+                        request.primary_travel_mode.value
+                        if request.primary_travel_mode
+                        else None
+                    )
+                ),
+                "route_distance_metres": (
+                    place.route_distance_metres
+                    if place.route_distance_metres is not None
+                    else place.distance_metres
+                ),
+                "one_way_travel_minutes": (
+                    place.route_duration_minutes
+                    if place.route_duration_minutes is not None
+                    else place.walking_minutes
+                ),
                 "environment": place.environment.value,
                 "public_access": place.public_access,
                 "wheelchair": place.wheelchair.value,
@@ -246,26 +232,48 @@ def build_user_prompt(
         "city": request.city,
         "requested_count": request.count,
         "profile": {
-            "motivations": [m.value for m in request.motivations],
-            "interests": request.likes,
-            "dislikes": request.dislikes,
-            "available_minutes": request.available_minutes,
-            "max_walking_minutes": request.max_walking_minutes,
-            "movement_intensity": request.movement_intensity.value,
+            "interest_preferences": [
+                item.model_dump(mode="json") for item in request.interest_preferences
+            ],
+            "custom_interests": [
+                item.model_dump(mode="json") for item in request.custom_interests
+            ],
+            "legacy_interests": (
+                {"likes": request.likes, "dislikes": request.dislikes}
+                if not request.interest_preferences and not request.custom_interests
+                else None
+            ),
+            "primary_intent": request.primary_intent.value,
+            "secondary_intents": [item.value for item in request.secondary_intents],
+            "activity_styles": [item.value for item in request.activity_styles],
+            "total_time_minutes": request.total_time_minutes,
+            "max_one_way_travel_minutes": request.max_one_way_travel_minutes,
+            "available_minutes": (
+                request.total_time_minutes or request.available_minutes
+            ),
+            "max_walking_minutes": (
+                request.max_one_way_travel_minutes or request.max_walking_minutes
+            ),
             "budget": request.budget.value,
             "social_comfort": request.social_comfort.value,
             "environment_preference": request.environment_preference.value,
-            "accessibility_notes": request.accessibility_notes,
+            "accessibility": (
+                request.accessibility.model_dump(mode="json")
+                if request.accessibility
+                else None
+            ),
         },
         "place_candidates": place_candidates,
-        "excluded_candidate_ids": list(excluded_candidate_ids or request.exclude_candidate_ids),
+        "excluded_candidate_ids": list(
+            excluded_candidate_ids or request.exclude_candidate_ids
+        ),
         "excluded_titles": request.exclude_titles,
         "notes": [
-            "Produce exactly the requested_count of diverse quests.",
-            "Bind each quest to candidate_id from place_candidates only.",
-            "Never invent amenities, hours, or place facts.",
-            "one-way walking_minutes + estimated_activity_minutes must fit available_minutes.",
-            "Do not include time windows, clock times, coordinates, or provider IDs.",
+            "Produce exactly the requested_count of quests.",
+            "Use candidate IDs from place_candidates.",
+            "Set intent to the primary intent when it fits; otherwise use a listed secondary intent.",
+            "Set activity_style to one of the selected activity styles.",
+            "Travel time is round trip and must leave enough time for the activity.",
         ],
     }
     return json.dumps(payload, indent=2)
@@ -313,7 +321,35 @@ def _strictify_schema(node: dict) -> dict:
 def draft_to_quest(
     draft: GeneratedQuestDraft,
     place: PlaceCandidateIn,
+    request: QuestGenerationRequest,
 ) -> GeneratedQuest:
+    affinities = {
+        item.topic: item.affinity.value for item in request.interest_preferences
+    }
+    topic = next(
+        (item for item in place.topics if affinities.get(item) == "love"),
+        place.topics[0] if place.topics else None,
+    )
+    intent = draft.intent or request.primary_intent
+    activity_style = draft.activity_style or (
+        request.activity_styles[0] if request.activity_styles else None
+    )
+    route_minutes = (
+        place.route_duration_minutes
+        if place.route_duration_minutes is not None
+        else place.walking_minutes
+    )
+    total_minutes = (
+        (route_minutes * 2) + draft.estimated_activity_minutes
+        if route_minutes is not None
+        else None
+    )
+    match_reasons: list[str] = []
+    if topic is not None:
+        match_reasons.append(f"Matches {topic.value.replace('_', ' ')}")
+    match_reasons.append(f"Your {intent.value} preference")
+    if total_minutes is not None:
+        match_reasons.append(f"{total_minutes} minutes total")
     return GeneratedQuest(
         title=draft.title.strip(),
         description=draft.description.strip(),
@@ -331,6 +367,15 @@ def draft_to_quest(
         estimated_activity_minutes=draft.estimated_activity_minutes,
         cost_band=draft.cost_band,
         activity_type=draft.activity_type.strip(),
+        topic=topic,
+        intent=intent,
+        activity_style=activity_style,
+        travel_mode=place.travel_mode or request.primary_travel_mode,
+        route_duration_minutes=route_minutes,
+        route_distance_meters=place.route_distance_metres,
+        total_estimated_minutes=total_minutes,
+        match_reasons=match_reasons[:3],
+        preference_version=request.preference_version,
     )
 
 
@@ -362,14 +407,24 @@ def validate_draft(
     allowed_categories = set(request.categories)
     if draft.category not in allowed_categories:
         return None
-    # Category must be compatible with the bound place.
     if draft.category != place.category:
+        return None
+    allowed_intents = {
+        request.primary_intent,
+        *request.secondary_intents,
+    }
+    if draft.intent is not None and draft.intent not in allowed_intents:
+        return None
+    if (
+        draft.activity_style is not None
+        and draft.activity_style not in request.activity_styles
+    ):
         return None
 
     if not cost_respects_budget(request.budget, draft.cost_band):
         return None
 
-    if request.social_comfort == SocialComfort.solo_only and requires_stranger_interaction(
+    if request.social_comfort.value == "solo_only" and requires_stranger_interaction(
         draft.title, draft.description, draft.activity_type
     ):
         return None
@@ -382,30 +437,40 @@ def validate_draft(
     ):
         return None
 
-    total_minutes = place.walking_minutes + draft.estimated_activity_minutes
-    if total_minutes > request.available_minutes:
+    route_minutes = (
+        place.route_duration_minutes
+        if place.route_duration_minutes is not None
+        else place.walking_minutes
+    )
+    total_budget = request.total_time_minutes or request.available_minutes
+    if route_minutes is None:
         return None
-
-    if place.walking_minutes > request.max_walking_minutes:
+    total_minutes = (route_minutes * 2) + draft.estimated_activity_minutes
+    if total_minutes > total_budget:
+        return None
+    one_way_limit = request.max_one_way_travel_minutes or request.max_walking_minutes
+    if route_minutes > one_way_limit:
         return None
 
     if not environment_compatible(
         request.environment_preference.value, place.environment
     ):
         return None
-
     if not is_safe_text(draft.title, draft.description):
         return None
-
     if accessibility_contradicted(
-        request.accessibility_notes,
+        (
+            request.accessibility.notes
+            if request.accessibility is not None
+            else request.accessibility_notes
+        ),
         draft.title,
         draft.description,
         place.wheelchair.value,
     ):
         return None
 
-    return draft_to_quest(draft, place)
+    return draft_to_quest(draft, place, request)
 
 
 class QuestGenerationService:
@@ -498,11 +563,11 @@ class QuestGenerationService:
                 excluded_candidate_ids=attempt_exclusions,
             )
             # Safety: never ship coordinates or home points to the model.
-            if re.search(r'"latitude"|"longitude"|home_latitude|home_longitude', user_prompt):
+            if re.search(
+                r'"latitude"|"longitude"|home_latitude|home_longitude', user_prompt
+            ):
                 logger.error("Blocked quest-generation prompt containing coordinates")
-                raise QuestGenerationError(
-                    "Refusing to send coordinates to OpenRouter"
-                )
+                raise QuestGenerationError("Refusing to send coordinates to OpenRouter")
             logger.info(
                 "Requesting quest batch: attempt=%s requested=%s available_candidates=%s excluded_candidates=%s",
                 attempt + 1,
@@ -536,6 +601,16 @@ class QuestGenerationService:
 
             for draft in batch.quests:
                 candidate_id = draft.candidate_id.strip()
+                logger.info(
+                    "Evaluating generated quest draft: attempt=%s candidate_id=%s category=%s difficulty=%s activity_type=%s activity_minutes=%s cost_band=%s",
+                    attempt + 1,
+                    candidate_id,
+                    draft.category.value,
+                    draft.difficulty.value,
+                    draft.activity_type,
+                    draft.estimated_activity_minutes,
+                    draft.cost_band.value,
+                )
                 if candidate_id not in id_to_place:
                     rejected_ids.add(candidate_id)
                     logger.warning(
