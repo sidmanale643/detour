@@ -9,9 +9,26 @@ export type Motivation =
   | "nature"
   | "break_routine";
 export type MovementIntensity = "gentle" | "moderate" | "energetic";
+export type TravelMode =
+  | "walking"
+  | "cycling"
+  | "two_wheeler"
+  | "four_wheeler"
+  | "public_transport";
 export type Budget = "free" | "low";
 export type SocialComfort = "solo_only" | "optional_interaction";
 export type EnvironmentPreference = "indoor" | "outdoor" | "either";
+export type InterestAffinity = "love" | "okay" | "avoid";
+export type QuestIntent = "explore" | "unwind" | "learn" | "create" | "move";
+export type ActivityStyle = "wander" | "observe" | "photograph" | "sketch_or_write" | "solve_or_research" | "reflect" | "workout";
+export type AccessibilityPreferences = {
+  stepFree: boolean;
+  wheelchairAccess: boolean;
+  maxWalkingMinutes: number | null;
+  seating: boolean;
+  lowSensory: boolean;
+  notes: string | null;
+};
 
 export type Quest = {
   id: string;
@@ -21,7 +38,7 @@ export type Quest = {
   duration: string;
   walkingMinutes: number | null;
   activityMinutes: number | null;
-  distanceSource: "walking_route" | "approximate" | null;
+  distanceSource: "google_routes" | "walking_route" | "approximate" | null;
   xp: number;
   category: QuestCategory;
   emoji: string;
@@ -34,6 +51,13 @@ export type Quest = {
   latitude?: number;
   longitude?: number;
   coordinates?: [longitude: number, latitude: number];
+  topic: string | null;
+  intent: QuestIntent | null;
+  activityStyle: ActivityStyle | null;
+  travelMode: TravelMode | null;
+  oneWayTravelMinutes: number | null;
+  totalEstimatedMinutes: number | null;
+  matchReasons: string[];
 };
 export type Progress = {
   xp: number;
@@ -42,6 +66,12 @@ export type Progress = {
   categories: Record<string, number>;
 };
 export type Coordinate = { latitude: number; longitude: number };
+export type RoutePreview = {
+  travelMode: TravelMode;
+  distanceMeters: number;
+  durationSeconds: number;
+  encodedPolyline: string | null;
+};
 export type HomeZone = {
   city: string;
   address: string;
@@ -65,22 +95,76 @@ export type Profile = {
   categories: string[];
   motivations: Motivation[];
   availableMinutes: number | null;
+  travelModes: TravelMode[];
+  maxTravelMinutes: number | null;
+  /** Legacy response field retained while older API clients migrate. */
   maxWalkingMinutes: number | null;
   movementIntensity: MovementIntensity;
   budget: Budget;
   socialComfort: SocialComfort;
   environmentPreference: EnvironmentPreference;
   accessibilityNotes: string | null;
+  interestPreferences: Record<string, InterestAffinity>;
+  customInterests: string[];
+  primaryIntent: QuestIntent;
+  secondaryIntents: QuestIntent[];
+  activityStyles: ActivityStyle[];
+  primaryTravelMode: TravelMode;
+  fallbackTravelModes: TravelMode[];
+  totalTimeMinutes: number | null;
+  maxOneWayTravelMinutes: number | null;
+  maxOneWayDistanceMetres: number | null;
+  accessibility: AccessibilityPreferences;
+  preferenceVersion: number;
   homeZone: HomeZone | null;
 };
 export type Deck = { quests: Quest[]; refreshAvailable: boolean };
+export type DiscoveryPlace = {
+  provider: "openstreetmap" | "wikidata" | "google_places";
+  providerId: string;
+  name: string;
+  placeType: string;
+  latitude: number;
+  longitude: number;
+  distanceMetres: number;
+  tripKind: "nearby" | "city" | "day_trip";
+  description: string | null;
+  imageUrl: string | null;
+  externalUrl: string | null;
+  rating: number | null;
+  reviewCount: number | null;
+  openNow: boolean | null;
+  cuisines: string[];
+};
+export type Discovery = {
+  city: string;
+  nearby: DiscoveryPlace[];
+  cityHighlights: DiscoveryPlace[];
+  dayTrips: DiscoveryPlace[];
+  food: DiscoveryPlace[];
+  foodAvailable: boolean;
+};
 
 export type PreferenceInput = {
+  interestPreferences?: Record<string, InterestAffinity>;
+  customInterests?: string[];
+  primaryIntent?: QuestIntent;
+  secondaryIntents?: QuestIntent[];
+  activityStyles?: ActivityStyle[];
+  primaryTravelMode?: TravelMode;
+  fallbackTravelModes?: TravelMode[];
+  totalTimeMinutes?: number | null;
+  maxOneWayTravelMinutes?: number | null;
+  maxOneWayDistanceMetres?: number | null;
+  accessibility?: AccessibilityPreferences;
   likes?: string[];
   dislikes?: string[];
   categories?: string[];
   motivations?: Motivation[];
   availableMinutes?: number | null;
+  travelModes?: TravelMode[];
+  maxTravelMinutes?: number | null;
+  /** Legacy request field retained for older callers. */
   maxWalkingMinutes?: number | null;
   movementIntensity?: MovementIntensity;
   budget?: Budget;
@@ -194,16 +278,18 @@ function mapQuest(raw: Record<string, unknown>, index = 0): Quest {
     raw.distance_source ?? raw.distanceSource ?? ""
   );
   const distanceSource =
-    distanceSourceRaw === "walking_route" || distanceSourceRaw === "approximate"
+    distanceSourceRaw === "google_routes" ||
+    distanceSourceRaw === "walking_route" ||
+    distanceSourceRaw === "approximate"
       ? distanceSourceRaw
       : null;
   const durationParts: string[] = [];
   if (walkingMinutes != null && Number.isFinite(walkingMinutes)) {
-    const walkLabel =
+    const travelLabel =
       distanceSource === "approximate"
-        ? `~${walkingMinutes} min walk`
-        : `${walkingMinutes} min walk`;
-    durationParts.push(walkLabel);
+        ? `~${walkingMinutes} min away`
+        : `${walkingMinutes} min away`;
+    durationParts.push(travelLabel);
   }
   if (activityMinutes != null && Number.isFinite(activityMinutes)) {
     durationParts.push(`${activityMinutes} min activity`);
@@ -212,6 +298,13 @@ function mapQuest(raw: Record<string, unknown>, index = 0): Quest {
     durationParts.length > 0
       ? durationParts.join(" · ")
       : `${({ easy: 15, medium: 25, hard: 40 }[String(raw.difficulty)] || 25)} min`;
+  const routeMinutesRaw = raw.one_way_travel_minutes ?? raw.travel_minutes ?? raw.walking_minutes;
+  const routeMinutes = routeMinutesRaw == null ? null : Number(routeMinutesRaw);
+  const totalMinutesRaw = raw.total_estimated_minutes ?? raw.total_duration_minutes;
+  const totalMinutes = totalMinutesRaw == null ? null : Number(totalMinutesRaw);
+  const travelMode = String(raw.travel_mode || "");
+  const intent = String(raw.intent || "");
+  const activityStyle = String(raw.activity_style || raw.activity_type || "");
 
   return {
     id: String(raw.id),
@@ -240,6 +333,13 @@ function mapQuest(raw: Record<string, unknown>, index = 0): Quest {
     startExpiresAt: raw.start_expires_at ? String(raw.start_expires_at) : null,
     time: start && end ? `${start} – ${end}` : "Anytime",
     detail: String(raw.description || "A small invitation to explore your city."),
+    topic: raw.topic ? String(raw.topic) : raw.category ? String(raw.category) : null,
+    intent: ["explore", "unwind", "learn", "create", "move"].includes(intent) ? intent as QuestIntent : null,
+    activityStyle: ["wander", "observe", "photograph", "sketch_or_write", "solve_or_research", "reflect", "workout"].includes(activityStyle) ? activityStyle as ActivityStyle : null,
+    travelMode: ["walking", "cycling", "two_wheeler", "four_wheeler", "public_transport"].includes(travelMode) ? travelMode as TravelMode : null,
+    oneWayTravelMinutes: Number.isFinite(routeMinutes) ? routeMinutes : null,
+    totalEstimatedMinutes: Number.isFinite(totalMinutes) ? totalMinutes : null,
+    matchReasons: Array.isArray(raw.match_reasons) ? raw.match_reasons.filter((value): value is string => typeof value === "string") : [],
     ...(Number.isFinite(latitude) && Number.isFinite(longitude)
       ? { latitude, longitude, coordinates: [longitude, latitude] as [number, number] }
       : {}),
@@ -273,9 +373,33 @@ function mapProfile(raw: Record<string, unknown>): Profile {
       ].includes(value)
   );
   const intensity = String(raw.movement_intensity || "gentle");
+  const rawTravelModes = Array.isArray(raw.travel_modes) ? raw.travel_modes : [];
+  const travelModes = rawTravelModes.filter(
+    (value): value is TravelMode =>
+      [
+        "walking",
+        "cycling",
+        "two_wheeler",
+        "four_wheeler",
+        "public_transport",
+      ].includes(String(value))
+  );
   const budget = String(raw.budget || "free");
   const social = String(raw.social_comfort || "solo_only");
   const environment = String(raw.environment_preference || "either");
+  const affinitiesRaw = raw.interest_preferences as Record<string, unknown> | undefined;
+  const interestPreferences = Object.fromEntries(Object.entries(affinitiesRaw || {}).flatMap(([key, value]) =>
+    ["love", "okay", "avoid"].includes(String(value)) ? [[key, String(value) as InterestAffinity]] : []
+  ));
+  const primaryIntentValue = String(raw.primary_intent || motivations[0] || "explore");
+  const primaryIntent = (["explore", "unwind", "learn", "create", "move"].includes(primaryIntentValue) ? primaryIntentValue : "explore") as QuestIntent;
+  const secondaryIntents = Array.isArray(raw.secondary_intents) ? raw.secondary_intents.filter((value): value is QuestIntent => ["explore", "unwind", "learn", "create", "move"].includes(String(value)) && value !== primaryIntent) : [];
+  const activityStyles = Array.isArray(raw.activity_styles) ? raw.activity_styles.filter((value): value is ActivityStyle => ["wander", "observe", "photograph", "sketch_or_write", "solve_or_research", "reflect", "workout"].includes(String(value))) : [];
+  const primaryTravelModeRaw = String(raw.primary_travel_mode || travelModes[0] || "walking");
+  const primaryTravelMode = (["walking", "cycling", "two_wheeler", "four_wheeler", "public_transport"].includes(primaryTravelModeRaw) ? primaryTravelModeRaw : "walking") as TravelMode;
+  const fallbackTravelModes = Array.isArray(raw.fallback_travel_modes) ? raw.fallback_travel_modes.filter((value): value is TravelMode => ["walking", "cycling", "two_wheeler", "four_wheeler", "public_transport"].includes(String(value)) && value !== primaryTravelMode) : travelModes.filter((mode) => mode !== primaryTravelMode);
+  const accessibilityRaw = raw.accessibility as Record<string, unknown> | undefined;
+  const accessibility: AccessibilityPreferences = { stepFree: Boolean(accessibilityRaw?.step_free ?? accessibilityRaw?.stepFree), wheelchairAccess: Boolean(accessibilityRaw?.wheelchair_access ?? accessibilityRaw?.wheelchairAccess), maxWalkingMinutes: typeof (accessibilityRaw?.max_walking_minutes ?? accessibilityRaw?.maxWalkingMinutes) === "number" ? Number(accessibilityRaw?.max_walking_minutes ?? accessibilityRaw?.maxWalkingMinutes) : null, seating: Boolean(accessibilityRaw?.seating), lowSensory: Boolean(accessibilityRaw?.low_sensory ?? accessibilityRaw?.lowSensory), notes: typeof (accessibilityRaw?.notes) === "string" ? String(accessibilityRaw?.notes) : raw.accessibility_notes as string | null };
   return {
     username: String(raw.username),
     email: String(raw.email),
@@ -286,6 +410,11 @@ function mapProfile(raw: Record<string, unknown>): Profile {
     categories: (raw.categories as string[]) || [],
     motivations,
     availableMinutes: (raw.available_minutes as number | null) ?? 30,
+    travelModes: travelModes.length ? travelModes : ["walking"],
+    maxTravelMinutes:
+      (raw.max_travel_minutes as number | null)
+      ?? (raw.max_walking_minutes as number | null)
+      ?? 20,
     maxWalkingMinutes: (raw.max_walking_minutes as number | null) ?? 20,
     movementIntensity: (
       ["gentle", "moderate", "energetic"].includes(intensity)
@@ -302,6 +431,18 @@ function mapProfile(raw: Record<string, unknown>): Profile {
         : "either"
     ) as EnvironmentPreference,
     accessibilityNotes: raw.accessibility_notes as string | null,
+    interestPreferences,
+    customInterests: Array.isArray(raw.custom_interests) ? raw.custom_interests.filter((value): value is string => typeof value === "string") : [],
+    primaryIntent,
+    secondaryIntents,
+    activityStyles,
+    primaryTravelMode,
+    fallbackTravelModes,
+    totalTimeMinutes: Number(raw.total_time_minutes ?? raw.available_minutes) || 30,
+    maxOneWayTravelMinutes: Number(raw.max_one_way_travel_minutes ?? raw.max_travel_minutes) || 20,
+    maxOneWayDistanceMetres: Number(raw.max_one_way_distance_metres) || 5_000,
+    accessibility,
+    preferenceVersion: Number(raw.preference_version || 1),
     homeZone: home
       ? {
           city: String(home.city),
@@ -431,12 +572,27 @@ class HttpQuestApi {
 
   async savePreferences(input: PreferenceInput) {
     const body: Record<string, unknown> = {};
+    if (input.interestPreferences !== undefined) body.interest_preferences = input.interestPreferences;
+    if (input.customInterests !== undefined) body.custom_interests = input.customInterests;
+    if (input.primaryIntent !== undefined) body.primary_intent = input.primaryIntent;
+    if (input.secondaryIntents !== undefined) body.secondary_intents = input.secondaryIntents;
+    if (input.activityStyles !== undefined) body.activity_styles = input.activityStyles;
+    if (input.primaryTravelMode !== undefined) body.primary_travel_mode = input.primaryTravelMode;
+    if (input.fallbackTravelModes !== undefined) body.fallback_travel_modes = input.fallbackTravelModes;
+    if (input.totalTimeMinutes !== undefined) body.total_time_minutes = input.totalTimeMinutes;
+    if (input.maxOneWayTravelMinutes !== undefined) body.max_one_way_travel_minutes = input.maxOneWayTravelMinutes;
+    if (input.maxOneWayDistanceMetres !== undefined) body.max_one_way_distance_metres = input.maxOneWayDistanceMetres;
+    if (input.accessibility !== undefined) body.accessibility = { step_free: input.accessibility.stepFree, wheelchair_access: input.accessibility.wheelchairAccess, max_walking_minutes: input.accessibility.maxWalkingMinutes, seating: input.accessibility.seating, low_sensory: input.accessibility.lowSensory, notes: input.accessibility.notes };
     if (input.likes !== undefined) body.likes = input.likes;
     if (input.dislikes !== undefined) body.dislikes = input.dislikes;
     if (input.categories !== undefined) body.categories = input.categories;
     if (input.motivations !== undefined) body.motivations = input.motivations;
     if (input.availableMinutes !== undefined) {
       body.available_minutes = input.availableMinutes;
+    }
+    if (input.travelModes !== undefined) body.travel_modes = input.travelModes;
+    if (input.maxTravelMinutes !== undefined) {
+      body.max_travel_minutes = input.maxTravelMinutes;
     }
     if (input.maxWalkingMinutes !== undefined) {
       body.max_walking_minutes = input.maxWalkingMinutes;
@@ -452,10 +608,38 @@ class HttpQuestApi {
     if (input.accessibilityNotes !== undefined) {
       body.accessibility_notes = input.accessibilityNotes;
     }
-    await this.request("/v1/profile", {
+    const response = await this.request("/v1/profile", {
       method: "PATCH",
       body: JSON.stringify(body),
     });
+    const raw = await response.json();
+    return raw && typeof raw === "object" && ("username" in raw || "profile" in raw) ? mapProfile((raw.profile || raw) as Record<string, unknown>) : this.profile();
+  }
+
+  async routePreview(
+    origin: Coordinate,
+    destination: Coordinate,
+    travelMode: TravelMode
+  ): Promise<RoutePreview> {
+    const data = await (
+      await this.request("/v1/routes/preview", {
+        method: "POST",
+        body: JSON.stringify({
+          origin,
+          destination,
+          travel_mode: travelMode,
+        }),
+      })
+    ).json();
+    return {
+      travelMode: data.travel_mode as TravelMode,
+      distanceMeters: Number(data.distance_meters),
+      durationSeconds: Number(data.duration_seconds),
+      encodedPolyline:
+        typeof data.encoded_polyline === "string"
+          ? data.encoded_polyline
+          : null,
+    };
   }
 
   async setHomeZone(input: {
@@ -500,8 +684,47 @@ class HttpQuestApi {
       );
   }
 
+  async discover(foodQuery?: string): Promise<Discovery> {
+    const params = new URLSearchParams();
+    if (foodQuery?.trim()) params.set("food_query", foodQuery.trim());
+    const suffix = params.size ? `?${params}` : "";
+    const raw = (await (await this.request(`/v1/discover${suffix}`)).json()) as Record<string, unknown>;
+    const mapPlace = (value: Record<string, unknown>): DiscoveryPlace => ({
+      provider: value.provider === "wikidata" || value.provider === "google_places" ? value.provider : "openstreetmap",
+      providerId: String(value.provider_id || ""),
+      name: String(value.name || "Unnamed place"),
+      placeType: String(value.place_type || "place").replaceAll("_", " "),
+      latitude: Number(value.latitude), longitude: Number(value.longitude),
+      distanceMetres: Number(value.distance_metres || 0),
+      tripKind: value.trip_kind === "day_trip" || value.trip_kind === "city" ? value.trip_kind : "nearby",
+      description: typeof value.description === "string" ? value.description : null,
+      imageUrl: typeof value.image_url === "string" ? value.image_url : null,
+      externalUrl: typeof value.external_url === "string" ? value.external_url : null,
+      rating: typeof value.rating === "number" ? value.rating : null,
+      reviewCount: typeof value.review_count === "number" ? value.review_count : null,
+      openNow: typeof value.open_now === "boolean" ? value.open_now : null,
+      cuisines: Array.isArray(value.cuisines) ? value.cuisines.filter((item): item is string => typeof item === "string") : [],
+    });
+    const places = (key: string) => Array.isArray(raw[key]) ? (raw[key] as Record<string, unknown>[]).map(mapPlace) : [];
+    return {
+      city: String(raw.city || "Your city"), nearby: places("nearby"),
+      cityHighlights: places("city_highlights"), dayTrips: places("day_trips"),
+      food: places("food"), foodAvailable: raw.food_available === true,
+    };
+  }
+
   async today(): Promise<Deck> {
     const data = await (await this.request("/v1/decks/today")).json();
+    return {
+      quests: data.quests.map(mapQuest),
+      refreshAvailable: data.refresh_available,
+    };
+  }
+
+  async generateDeck(): Promise<Deck> {
+    const data = await (
+      await this.request("/v1/decks/today/generate", { method: "POST" })
+    ).json();
     return {
       quests: data.quests.map(mapQuest),
       refreshAvailable: data.refresh_available,
