@@ -10,12 +10,10 @@ Detour is a mobile-first, honor-system PWA for personalized real-world quests. P
 - Provider boundaries for Redis and Dramatiq background generation
 - MapLibre with OpenStreetMap tiles, Nominatim search, and Overpass places
 - Google Routes for verified travel times and route previews across every supported mode
-- Google Places plus Wikidata for live Discover food venues and landmark context
+- Google Places for live Discover food venues
 - OpenRouter for structured quest personalization
 
-There is intentionally no proof upload, camera access, completion-location verification, or verifier service. Quest completion is an irreversible honor-system action. During home setup, a player can explicitly choose to save their current device location as home. Later device-location use stays in browser memory and is sent to the authenticated API only after the player requests a route preview. Travel preferences support walking, cycling, two-wheelers, four-wheelers, and public transport. Running is an activity style, not a travel mode.
-
-Authentication is currently bypassed by default so the local app opens directly to the quest map. Set `NEXT_PUBLIC_AUTH_DISABLED=false` in `web/.env.local` to restore registration and login.
+There is intentionally no proof upload, camera access, completion-location verification, verifier service, or account system. Quest completion is an irreversible honor-system action. During home setup, a player can explicitly choose to save their current device location as home. Later device-location use stays in browser memory and is sent to the local API only after the player requests a route preview. Travel preferences support walking, cycling, two-wheelers, four-wheelers, and public transport. Running is an activity style, not a travel mode.
 
 ## Local development
 
@@ -68,7 +66,7 @@ The web client consumes versioned `/v1` JSON endpoints. The implementation shoul
 
 Quest states are `offered`, `completed`, `skipped`, `superseded`, and `expired`. Completion is server-authoritative and idempotent: repeated requests return the original completion result and cannot issue more XP.
 
-Authentication, profile/preferences, home-zone selection, password recovery, session management, and account deletion also live under `/v1`. The API owns the stored IANA timezone, expiry rules, XP calculation, and mutable quest state. The client sends a precise location only when the player explicitly saves it as home or requests a route. It must not send proof, camera data, completion locations, or client-calculated XP.
+Profile preferences and home-zone selection live under `/v1` for the single local player. The API owns the stored IANA timezone, expiry rules, XP calculation, and mutable quest state. The client sends a precise location only when the player explicitly saves it as home or requests a route. It must not send proof, camera data, completion locations, or client-calculated XP.
 
 ## Environment
 
@@ -88,12 +86,9 @@ Root `.env` is for local coordination only. Package-specific runtime configurati
 | `DETOUR_GOOGLE_ROUTES_KEY` | Yes for generated decks | Server-only Google Routes API key for verified matching and previews. |
 | `DETOUR_GOOGLE_ROUTES_URL` | Optional | Google Routes API base URL. |
 | `DETOUR_GOOGLE_ROUTES_TIMEOUT_SECONDS` | Optional | Google Routes request timeout in seconds. |
-| `DETOUR_GOOGLE_PLACES_KEY` | Optional | Server-only Google Places API key for live food discovery. Enable Places API (New), restrict the key, and never expose it to the browser. Without it, Discover still returns OSM/Wikidata places and shows food as unavailable. |
-| `DETOUR_WIKIDATA_SPARQL_URL` | Optional | Wikidata Query Service endpoint used for regional landmark discovery. |
+| `DETOUR_GOOGLE_PLACES_KEY` | Optional | Server-only Google Places API key for live food discovery. Enable Places API (New), restrict the key, and never expose it to the browser. Without it, Discover returns OSM places and shows food as unavailable. |
 | `OPENROUTER_API_KEY` | Yes for generated decks | OpenRouter key. Never expose to the browser. |
 | `OPENROUTER_QUEST_MODEL` | Yes for generated decks | Structured-output-capable OpenRouter model ID. |
-| `JWT_SECRET` | Yes for API | High-entropy signing secret. |
-| `REFRESH_TOKEN_PEPPER` | Yes for API | Separate high-entropy secret for refresh-token hashing. |
 | `APP_ENV` | Yes | Runtime environment such as `development`. |
 
 Use separate restricted provider credentials for local development. Never place private provider tokens in variables prefixed `NEXT_PUBLIC_`.
@@ -104,7 +99,7 @@ The Map tab uses MapLibre with a configurable OpenMapTiles-compatible vector sou
 
 The public OpenStreetMap, Nominatim, and Overpass endpoints are development defaults, not an unlimited production backend. Use hosted or self-hosted endpoints, retain visible OpenStreetMap attribution, identify server requests, cache responsibly, and follow each service's usage policy.
 
-Home setup accepts a searched address, a map-pinned point, or the device's live location after explicit browser permission. The chosen home label, input method, exact point, and server-derived resolution-7 H3 zone are stored on the player's account. No location is collected in the background and completion locations are never stored.
+Home setup accepts a searched address, a map-pinned point, or the device's live location after explicit browser permission. The chosen home label, input method, exact point, and server-derived resolution-7 H3 zone are stored for the local player. No location is collected in the background and completion locations are never stored.
 
 ## Developer checks
 
